@@ -45,7 +45,7 @@ type logColumns struct {
 func NewLogsExporter(logger *zap.Logger) (*LogsExporter, error) {
 	return &LogsExporter{
 		logger:       logger,
-		maxBatchSize: 10_000,
+		maxBatchSize: 8192,
 	}, nil
 }
 
@@ -65,6 +65,7 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 	}
 	e.db = c
 
+	jsonSize := 512
 	strSize := 64
 	bSize := e.maxBatchSize
 
@@ -85,39 +86,39 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 			Buf: make([]byte, 0, strSize*bSize),
 			Pos: make([]proto.Position, 0, bSize),
 		},
-		traceFlags: make(proto.ColUInt8, 0, bSize),
-		severityText: proto.NewLowCardinality[string](&proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		}),
+		traceFlags:     make(proto.ColUInt8, 0, bSize),
+		severityText:   newLowCardinalityString(strSize, bSize),
 		severityNumber: make(proto.ColUInt8, 0, bSize),
-		serviceName: proto.NewLowCardinality[string](&proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		}),
+		serviceName:    newLowCardinalityString(strSize, bSize),
 		body: proto.ColStr{
 			Buf: make([]byte, 0, strSize*bSize),
 			Pos: make([]proto.Position, 0, bSize),
 		},
-		resourceSchemaUrl: proto.NewLowCardinality[string](&proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		}),
-		resourceAttributes: proto.ColJSONStr{},
-		scopeSchemaUrl: proto.NewLowCardinality[string](&proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		}),
+		resourceSchemaUrl: newLowCardinalityString(strSize, bSize),
+		resourceAttributes: proto.ColJSONStr{
+			Str: proto.ColStr{
+				Buf: make([]byte, 0, jsonSize*bSize),
+				Pos: make([]proto.Position, 0, bSize),
+			},
+		},
+		scopeSchemaUrl: newLowCardinalityString(strSize, bSize),
 		scopeName: proto.ColStr{
 			Buf: make([]byte, 0, strSize*bSize),
 			Pos: make([]proto.Position, 0, bSize),
 		},
-		scopeVersion: proto.NewLowCardinality[string](&proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		}),
-		scopeAttributes: proto.ColJSONStr{},
-		logAttributes:   proto.ColJSONStr{},
+		scopeVersion: newLowCardinalityString(strSize, bSize),
+		scopeAttributes: proto.ColJSONStr{
+			Str: proto.ColStr{
+				Buf: make([]byte, 0, jsonSize*bSize),
+				Pos: make([]proto.Position, 0, bSize),
+			},
+		},
+		logAttributes: proto.ColJSONStr{
+			Str: proto.ColStr{
+				Buf: make([]byte, 0, jsonSize*bSize),
+				Pos: make([]proto.Position, 0, bSize),
+			},
+		},
 	}
 	e.columns = cols
 
@@ -140,6 +141,16 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 	}
 
 	return nil
+}
+
+func newLowCardinalityString(strSize, bufSize int) *proto.ColLowCardinality[string] {
+	lc := proto.NewLowCardinality[string](&proto.ColStr{
+		Buf: make([]byte, 0, strSize*bufSize),
+		Pos: make([]proto.Position, 0, bufSize),
+	})
+	lc.Values = make([]string, 0, bufSize)
+
+	return lc
 }
 
 func (e *LogsExporter) Shutdown(_ context.Context) error {

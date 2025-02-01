@@ -2,15 +2,17 @@ package logs
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/zap"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -32,12 +34,12 @@ type logColumns struct {
 	serviceName        *proto.ColLowCardinality[string]
 	body               proto.ColStr
 	resourceSchemaUrl  *proto.ColLowCardinality[string]
-	resourceAttributes proto.ColJSONBytes
+	resourceAttributes proto.ColJSONStr
 	scopeSchemaUrl     *proto.ColLowCardinality[string]
 	scopeName          proto.ColStr
 	scopeVersion       *proto.ColLowCardinality[string]
-	scopeAttributes    proto.ColJSONBytes
-	logAttributes      proto.ColJSONBytes
+	scopeAttributes    proto.ColJSONStr
+	logAttributes      proto.ColJSONStr
 }
 
 func NewLogsExporter(logger *zap.Logger) (*LogsExporter, error) {
@@ -101,7 +103,7 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 			Buf: make([]byte, 0, strSize*bSize),
 			Pos: make([]proto.Position, 0, bSize),
 		}),
-		resourceAttributes: proto.ColJSONBytes{},
+		resourceAttributes: proto.ColJSONStr{},
 		scopeSchemaUrl: proto.NewLowCardinality[string](&proto.ColStr{
 			Buf: make([]byte, 0, strSize*bSize),
 			Pos: make([]proto.Position, 0, bSize),
@@ -114,8 +116,8 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 			Buf: make([]byte, 0, strSize*bSize),
 			Pos: make([]proto.Position, 0, bSize),
 		}),
-		scopeAttributes: proto.ColJSONBytes{},
-		logAttributes:   proto.ColJSONBytes{},
+		scopeAttributes: proto.ColJSONStr{},
+		logAttributes:   proto.ColJSONStr{},
 	}
 	e.columns = cols
 
@@ -144,8 +146,6 @@ func (e *LogsExporter) Shutdown(_ context.Context) error {
 	return e.db.Close()
 }
 
-var emptyJSON = []byte("{}")
-
 func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 	cols := e.columns
 	e.insertInput.Reset()
@@ -160,11 +160,7 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 		resURL := logs.SchemaUrl()
 		resAttr := res.Attributes()
 		serviceName := internal.GetServiceName(resAttr)
-
-		var resAttrBytes = emptyJSON
-		if resAttr.Len() > 0 {
-			resAttrBytes, _ = json.Marshal(resAttr.AsRaw())
-		}
+		resAttrStr := attributesToJSONString(resAttr)
 
 		slLen := logs.ScopeLogs().Len()
 		for j := 0; j < slLen; j++ {
@@ -175,24 +171,16 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 			scopeVersion := scopeLogScope.Version()
 			scopeAttr := scopeLogScope.Attributes()
 			scopeLogRecords := scopeLog.LogRecords()
-
-			var scopeAttrBytes = emptyJSON
-			if scopeAttr.Len() > 0 {
-				scopeAttrBytes, _ = json.Marshal(scopeAttr.AsRaw())
-			}
+			scopeAttrStr := attributesToJSONString(scopeAttr)
 
 			for k := 0; k < scopeLogRecords.Len(); k++ {
 				r := scopeLogRecords.At(k)
 				logAttr := r.Attributes()
+				logAttrStr := attributesToJSONString(logAttr)
 
 				timestamp := r.Timestamp()
 				if timestamp == 0 {
 					timestamp = r.ObservedTimestamp()
-				}
-
-				var logAttrBytes = emptyJSON
-				if logAttr.Len() > 0 {
-					logAttrBytes, _ = json.Marshal(logAttr.AsRaw())
 				}
 
 				cols.timestamp.Append(proto.DateTime64(timestamp))
@@ -204,12 +192,12 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 				cols.serviceName.Append(serviceName)
 				cols.body.Append(r.Body().AsString())
 				cols.resourceSchemaUrl.Append(resURL)
-				cols.resourceAttributes.Append(resAttrBytes)
+				cols.resourceAttributes.Append(resAttrStr)
 				cols.scopeSchemaUrl.Append(scopeURL)
 				cols.scopeName.Append(scopeName)
 				cols.scopeVersion.Append(scopeVersion)
-				cols.scopeAttributes.Append(scopeAttrBytes)
-				cols.logAttributes.Append(logAttrBytes)
+				cols.scopeAttributes.Append(scopeAttrStr)
+				cols.logAttributes.Append(logAttrStr)
 			}
 		}
 	}
@@ -226,4 +214,54 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 		zap.String("cost", duration.String()))
 
 	return nil
+}
+
+func attributesToJSONString(m pcommon.Map) string {
+	if m.Len() == 0 {
+		return "{}"
+	}
+
+	var sb strings.Builder
+	sb.WriteRune('{')
+	var first = true
+	m.Range(func(k string, v pcommon.Value) bool {
+		if first {
+			first = false
+		} else {
+			sb.WriteRune(',')
+		}
+
+		sb.WriteString(strconv.Quote(k))
+		sb.WriteRune(':')
+		sb.WriteString(valueToString(v))
+
+		return true
+	})
+	sb.WriteRune('}')
+
+	return sb.String()
+}
+
+func valueToString(v pcommon.Value) string {
+	switch v.Type() {
+	case pcommon.ValueTypeEmpty:
+		return "null"
+	case pcommon.ValueTypeStr:
+		return strconv.Quote(v.Str())
+	case pcommon.ValueTypeBool:
+		return strconv.FormatBool(v.Bool())
+	case pcommon.ValueTypeDouble:
+		return strconv.FormatFloat(v.Double(), 'g', -1, 64)
+	case pcommon.ValueTypeInt:
+		return strconv.FormatInt(v.Int(), 10)
+	case pcommon.ValueTypeBytes:
+		return string(v.Bytes().AsRaw())
+	case pcommon.ValueTypeMap:
+		return attributesToJSONString(v.Map())
+	case pcommon.ValueTypeSlice:
+		//return v.Slice().AsRaw()
+		return "[]"
+	default:
+		return ""
+	}
 }

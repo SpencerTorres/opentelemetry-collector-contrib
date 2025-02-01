@@ -8,6 +8,7 @@ package clickhouseexporter // import "github.com/open-telemetry/opentelemetry-co
 import (
 	"context"
 	"fmt"
+	chlogs "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/logs"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
@@ -60,7 +61,7 @@ func createLogsExporter(
 	cfg component.Config,
 ) (exporter.Logs, error) {
 	c := cfg.(*Config)
-	exporter, err := newLogsExporter(set.Logger, c)
+	exporter, err := chlogs.NewLogsExporter(set.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("cannot configure clickhouse logs exporter: %w", err)
 	}
@@ -69,9 +70,9 @@ func createLogsExporter(
 		ctx,
 		set,
 		cfg,
-		exporter.pushLogsData,
-		exporterhelper.WithStart(exporter.start),
-		exporterhelper.WithShutdown(exporter.shutdown),
+		exporter.PushLogsData,
+		exporterhelper.WithStart(exporter.Start),
+		exporterhelper.WithShutdown(exporter.Shutdown),
 		exporterhelper.WithTimeout(c.TimeoutSettings),
 		exporterhelper.WithQueue(c.QueueSettings),
 		exporterhelper.WithRetry(c.BackOffConfig),

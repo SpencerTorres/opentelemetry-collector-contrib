@@ -259,6 +259,7 @@ func attributesToJSON(b *JSONBuffer, m pcommon.Map) {
 		} else {
 			b.WriteByte(',')
 		}
+
 		b.WriteQuote(k)
 		b.WriteByte(':')
 		valueToJSON(b, v)
@@ -302,10 +303,12 @@ func serializeSlice(b *JSONBuffer, s pcommon.Slice) {
 
 	b.grow(2)
 	b.buf = append(b.buf, '[')
-	for i := 0; i < s.Len(); i++ {
+	sLen := s.Len()
+	for i := 0; i < sLen; i++ {
 		if i > 0 {
 			b.WriteByte(',')
 		}
+
 		valueToJSON(b, s.At(i))
 	}
 	b.buf = append(b.buf, ']')

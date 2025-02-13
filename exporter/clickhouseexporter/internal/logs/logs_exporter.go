@@ -2,6 +2,7 @@ package logs
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
@@ -12,7 +13,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/zap"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -22,6 +22,10 @@ type LogsExporter struct {
 	maxBatchSize int
 	columns      *logColumns
 	insertInput  proto.Input
+
+	resourceAttributesJSONBuffer *JSONBuffer
+	scopeAttributesJSONBuffer    *JSONBuffer
+	logAttributesJSONBuffer      *JSONBuffer
 }
 
 type logColumns struct {
@@ -34,12 +38,12 @@ type logColumns struct {
 	serviceName        *proto.ColLowCardinality[string]
 	body               proto.ColStr
 	resourceSchemaUrl  *proto.ColLowCardinality[string]
-	resourceAttributes proto.ColJSONStr
+	resourceAttributes proto.ColJSONBytes
 	scopeSchemaUrl     *proto.ColLowCardinality[string]
 	scopeName          proto.ColStr
 	scopeVersion       *proto.ColLowCardinality[string]
-	scopeAttributes    proto.ColJSONStr
-	logAttributes      proto.ColJSONStr
+	scopeAttributes    proto.ColJSONBytes
+	logAttributes      proto.ColJSONBytes
 }
 
 func NewLogsExporter(logger *zap.Logger) (*LogsExporter, error) {
@@ -54,6 +58,7 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 		Address:     "localhost:9000",
 		Database:    "otel_chgo",
 		Compression: ch.CompressionLZ4,
+
 		Settings: []ch.Setting{
 			{Key: "allow_json_type", Value: "1"},
 		},
@@ -95,10 +100,12 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 			Pos: make([]proto.Position, 0, bSize),
 		},
 		resourceSchemaUrl: newLowCardinalityString(strSize, bSize),
-		resourceAttributes: proto.ColJSONStr{
-			Str: proto.ColStr{
-				Buf: make([]byte, 0, jsonSize*bSize),
-				Pos: make([]proto.Position, 0, bSize),
+		resourceAttributes: proto.ColJSONBytes{
+			ColJSONStr: proto.ColJSONStr{
+				Str: proto.ColStr{
+					Buf: make([]byte, 0, jsonSize*bSize),
+					Pos: make([]proto.Position, 0, bSize),
+				},
 			},
 		},
 		scopeSchemaUrl: newLowCardinalityString(strSize, bSize),
@@ -107,16 +114,20 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 			Pos: make([]proto.Position, 0, bSize),
 		},
 		scopeVersion: newLowCardinalityString(strSize, bSize),
-		scopeAttributes: proto.ColJSONStr{
-			Str: proto.ColStr{
-				Buf: make([]byte, 0, jsonSize*bSize),
-				Pos: make([]proto.Position, 0, bSize),
+		scopeAttributes: proto.ColJSONBytes{
+			ColJSONStr: proto.ColJSONStr{
+				Str: proto.ColStr{
+					Buf: make([]byte, 0, jsonSize*bSize),
+					Pos: make([]proto.Position, 0, bSize),
+				},
 			},
 		},
-		logAttributes: proto.ColJSONStr{
-			Str: proto.ColStr{
-				Buf: make([]byte, 0, jsonSize*bSize),
-				Pos: make([]proto.Position, 0, bSize),
+		logAttributes: proto.ColJSONBytes{
+			ColJSONStr: proto.ColJSONStr{
+				Str: proto.ColStr{
+					Buf: make([]byte, 0, jsonSize*bSize),
+					Pos: make([]proto.Position, 0, bSize),
+				},
 			},
 		},
 	}
@@ -139,6 +150,10 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 		{Name: "ScopeAttributes", Data: &cols.scopeAttributes},
 		{Name: "LogAttributes", Data: &cols.logAttributes},
 	}
+
+	e.resourceAttributesJSONBuffer = &JSONBuffer{buf: make([]byte, 0, 8192)}
+	e.scopeAttributesJSONBuffer = &JSONBuffer{buf: make([]byte, 0, 8192)}
+	e.logAttributesJSONBuffer = &JSONBuffer{buf: make([]byte, 0, 8192)}
 
 	return nil
 }
@@ -171,7 +186,8 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 		resURL := logs.SchemaUrl()
 		resAttr := res.Attributes()
 		serviceName := internal.GetServiceName(resAttr)
-		resAttrStr := attributesToJSONString(resAttr)
+		e.resourceAttributesJSONBuffer.Reset()
+		attributesToJSON(e.resourceAttributesJSONBuffer, resAttr)
 
 		slLen := logs.ScopeLogs().Len()
 		for j := 0; j < slLen; j++ {
@@ -180,14 +196,14 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 			scopeLogScope := scopeLog.Scope()
 			scopeName := scopeLogScope.Name()
 			scopeVersion := scopeLogScope.Version()
-			scopeAttr := scopeLogScope.Attributes()
 			scopeLogRecords := scopeLog.LogRecords()
-			scopeAttrStr := attributesToJSONString(scopeAttr)
+			e.scopeAttributesJSONBuffer.Reset()
+			attributesToJSON(e.scopeAttributesJSONBuffer, scopeLogScope.Attributes())
 
 			for k := 0; k < scopeLogRecords.Len(); k++ {
 				r := scopeLogRecords.At(k)
-				logAttr := r.Attributes()
-				logAttrStr := attributesToJSONString(logAttr)
+				e.logAttributesJSONBuffer.Reset()
+				attributesToJSON(e.logAttributesJSONBuffer, r.Attributes())
 
 				timestamp := r.Timestamp()
 				if timestamp == 0 {
@@ -203,12 +219,12 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 				cols.serviceName.Append(serviceName)
 				cols.body.Append(r.Body().AsString())
 				cols.resourceSchemaUrl.Append(resURL)
-				cols.resourceAttributes.Append(resAttrStr)
+				cols.resourceAttributes.Append(e.resourceAttributesJSONBuffer.Bytes())
 				cols.scopeSchemaUrl.Append(scopeURL)
 				cols.scopeName.Append(scopeName)
 				cols.scopeVersion.Append(scopeVersion)
-				cols.scopeAttributes.Append(scopeAttrStr)
-				cols.logAttributes.Append(logAttrStr)
+				cols.scopeAttributes.Append(e.scopeAttributesJSONBuffer.Bytes())
+				cols.logAttributes.Append(e.logAttributesJSONBuffer.Bytes())
 			}
 		}
 	}
@@ -227,52 +243,123 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 	return nil
 }
 
-func attributesToJSONString(m pcommon.Map) string {
+// attributesToJSON serializes attributes to JSON using a reusable buffer
+func attributesToJSON(b *JSONBuffer, m pcommon.Map) {
 	if m.Len() == 0 {
-		return "{}"
+		b.WriteString("{}")
+		return
 	}
 
-	var sb strings.Builder
-	sb.WriteRune('{')
-	var first = true
+	b.grow(2)
+	b.buf = append(b.buf, '{')
+	first := true
 	m.Range(func(k string, v pcommon.Value) bool {
 		if first {
 			first = false
 		} else {
-			sb.WriteRune(',')
+			b.WriteByte(',')
 		}
-
-		sb.WriteString(strconv.Quote(k))
-		sb.WriteRune(':')
-		sb.WriteString(valueToString(v))
-
+		b.WriteQuote(k)
+		b.WriteByte(':')
+		valueToJSON(b, v)
 		return true
 	})
-	sb.WriteRune('}')
-
-	return sb.String()
+	b.buf = append(b.buf, '}')
 }
 
-func valueToString(v pcommon.Value) string {
+func valueToJSON(b *JSONBuffer, v pcommon.Value) {
 	switch v.Type() {
 	case pcommon.ValueTypeEmpty:
-		return "null"
+		b.WriteString("null")
 	case pcommon.ValueTypeStr:
-		return strconv.Quote(v.Str())
+		b.WriteQuote(v.Str())
 	case pcommon.ValueTypeBool:
-		return strconv.FormatBool(v.Bool())
+		if v.Bool() {
+			b.WriteString("true")
+		} else {
+			b.WriteString("false")
+		}
 	case pcommon.ValueTypeDouble:
-		return strconv.FormatFloat(v.Double(), 'g', -1, 64)
+		b.buf = strconv.AppendFloat(b.buf, v.Double(), 'g', -1, 64)
 	case pcommon.ValueTypeInt:
-		return strconv.FormatInt(v.Int(), 10)
+		b.buf = strconv.AppendInt(b.buf, v.Int(), 10)
 	case pcommon.ValueTypeBytes:
-		return string(v.Bytes().AsRaw())
+		serializeBytesBase64(b, v.Bytes())
 	case pcommon.ValueTypeMap:
-		return attributesToJSONString(v.Map())
+		attributesToJSON(b, v.Map())
 	case pcommon.ValueTypeSlice:
-		//return v.Slice().AsRaw()
-		return "[]"
+		serializeSlice(b, v.Slice())
 	default:
-		return ""
+		b.WriteString("null")
 	}
+}
+
+func serializeSlice(b *JSONBuffer, s pcommon.Slice) {
+	if s.Len() == 0 {
+		b.WriteString("[]")
+		return
+	}
+
+	b.grow(2)
+	b.buf = append(b.buf, '[')
+	for i := 0; i < s.Len(); i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		valueToJSON(b, s.At(i))
+	}
+	b.buf = append(b.buf, ']')
+}
+
+func serializeBytesBase64(b *JSONBuffer, bs pcommon.ByteSlice) {
+	raw := bs.AsRaw()
+	n := base64.StdEncoding.EncodedLen(len(raw))
+
+	start := len(b.buf)
+	b.grow(n + 2)
+
+	b.buf = append(b.buf, '"')
+
+	dst := b.buf[start+1 : start+1+n]
+	base64.StdEncoding.Encode(dst, raw)
+	b.buf = b.buf[:start+1+n]
+
+	b.buf = append(b.buf, '"')
+}
+
+// JSONBuffer is a reusable buffer for faster JSON serialization
+type JSONBuffer struct {
+	buf []byte
+}
+
+func (b *JSONBuffer) Reset() {
+	b.buf = b.buf[:0]
+}
+
+func (b *JSONBuffer) Bytes() []byte {
+	return b.buf
+}
+
+func (b *JSONBuffer) grow(n int) {
+	if cap(b.buf)-len(b.buf) < n {
+		buf := make([]byte, len(b.buf), 2*cap(b.buf)+n)
+		copy(buf, b.buf)
+		b.buf = buf
+	}
+}
+
+func (b *JSONBuffer) WriteString(s string) {
+	b.grow(len(s))
+	b.buf = append(b.buf, s...)
+}
+
+func (b *JSONBuffer) WriteByte(c byte) {
+	b.grow(1)
+	b.buf = append(b.buf, c)
+}
+
+// WriteQuote writes a quoted string to the buffer
+func (b *JSONBuffer) WriteQuote(s string) {
+	b.grow(len(s) + 2)
+	b.buf = strconv.AppendQuote(b.buf, s)
 }

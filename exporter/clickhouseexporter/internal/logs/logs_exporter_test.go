@@ -1,6 +1,8 @@
 package logs
 
 import (
+	"github.com/ClickHouse/clickhouse-go/v2/lib/column"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/column/orderedmap"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"testing"
@@ -73,5 +75,23 @@ func BenchmarkAttributesToJSON(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		jb.Reset()
 		attributesToJSON(&jb, m)
+	}
+}
+
+func attributesToMap(attributes pcommon.Map) column.IterableOrderedMap {
+	return orderedmap.CollectN(func(yield func(string, string) bool) {
+		attributes.Range(func(k string, v pcommon.Value) bool {
+			return yield(k, v.AsString())
+		})
+	}, attributes.Len())
+}
+
+func BenchmarkAttributesToMap(b *testing.B) {
+	m := testMap()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		attributesToMap(m)
 	}
 }

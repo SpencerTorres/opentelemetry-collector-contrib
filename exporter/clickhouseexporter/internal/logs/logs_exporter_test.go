@@ -12,6 +12,7 @@ func testMap() pcommon.Map {
 	attrs.PutStr("app", "telemetry-service")
 	attrs.PutInt("process.pid", 12345)
 	attrs.PutBool("debug.enabled", true)
+	attrs.PutEmpty("request_id")
 
 	serverInfo := attrs.PutEmptyMap("server.info")
 	serverInfo.PutStr("hostname", "prod-server-01")
@@ -51,20 +52,23 @@ func testMap() pcommon.Map {
 
 func TestAttributesToJSON(t *testing.T) {
 	m := testMap()
+
+	secretBytes := m.PutEmptyBytes("secret")
+	secretBytes.Append(0xA, 0xB, 0xC)
+
 	jb := JSONBuffer{buf: make([]byte, 0, 1024)}
 	attributesToJSON(&jb, m)
 
 	actual := string(jb.Bytes())
-	expected := `{"app":"telemetry-service","process.pid":12345,"debug.enabled":true,"server.info":{"hostname":"prod-server-01","uptime":156.7,"metadata":{"region":"us-west-2","tier":"premium"}},"user.roles":["admin","editor","viewer"],"system.metrics":[0.75,0.83,0.3335],"resource.usage":{"cpu":{"cores":8,"loads":[1.5,2,1.8]},"memory":{"total":16384,"used":8192,"allocations":[1024,2048,4096]}}}`
+	expected := `{"app":"telemetry-service","process.pid":12345,"debug.enabled":true,"request_id":null,"server.info":{"hostname":"prod-server-01","uptime":156.7,"metadata":{"region":"us-west-2","tier":"premium"}},"user.roles":["admin","editor","viewer"],"system.metrics":[0.75,0.83,0.3335],"resource.usage":{"cpu":{"cores":8,"loads":[1.5,2,1.8]},"memory":{"total":16384,"used":8192,"allocations":[1024,2048,4096]}},"secret":"CgsM"}`
 	require.Equal(t, expected, actual)
 }
 
 func BenchmarkAttributesToJSON(b *testing.B) {
-	b.ReportAllocs()
-
 	m := testMap()
 	jb := JSONBuffer{buf: make([]byte, 0, 1024)}
 
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		jb.Reset()

@@ -2,9 +2,11 @@ package logs
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"github.com/ClickHouse/ch-go"
+	"github.com/ClickHouse/ch-go/compress"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
@@ -17,12 +19,14 @@ import (
 )
 
 type LogsExporter struct {
+	cfg    *LogsConfig
 	logger *zap.Logger
 
 	db *ch.Client
 
 	maxBatchSize int
 	columns      *logColumns
+	insertSQL    string
 	insertInput  proto.Input
 
 	resourceAttributesJSONBuffer *JSONBuffer
@@ -48,24 +52,53 @@ type logColumns struct {
 	logAttributes      proto.ColJSONBytes
 }
 
-func NewLogsExporter(logger *zap.Logger) (*LogsExporter, error) {
+type LogsConfig struct {
+	Address          string
+	User             string
+	Password         string
+	Database         string
+	Table            string
+	Compression      string
+	CompressionLevel int
+	TLS              bool
+	ClientName       string
+	Settings         map[string]string
+}
+
+func NewLogsExporter(cfg *LogsConfig, logger *zap.Logger) (*LogsExporter, error) {
 	return &LogsExporter{
-		logger:       logger,
+		cfg:          cfg,
+		logger:       logger.Named("clickhouse"),
 		maxBatchSize: 8192,
+		insertSQL:    fmt.Sprintf(`INSERT INTO "%s"."%s" VALUES`, cfg.Database, cfg.Table),
 	}, nil
 }
 
 func (e *LogsExporter) connectDB(ctx context.Context) error {
 	_ = e.closeDB()
 
+	compressMethod, _ := compress.MethodString(e.cfg.Compression)
+
+	var tlsCfg *tls.Config
+	if e.cfg.TLS {
+		tlsCfg = &tls.Config{}
+	}
+
 	opts := ch.Options{
-		Address:          "127.0.0.1:9000",
-		Database:         "otel_chgo",
-		Compression:      ch.CompressionLZ4,
-		CompressionLevel: 3,
-		Settings: []ch.Setting{
-			{Key: "allow_json_type", Value: "1"},
-		},
+		Address:          e.cfg.Address,
+		User:             e.cfg.User,
+		Password:         e.cfg.Password,
+		Database:         e.cfg.Database,
+		Compression:      ch.Compression(compressMethod),
+		CompressionLevel: ch.CompressionLevel(e.cfg.CompressionLevel),
+		ClientName:       e.cfg.ClientName,
+		TLS:              tlsCfg,
+		Settings:         make([]ch.Setting, 1, 1+len(e.cfg.Settings)),
+	}
+
+	opts.Settings[0] = ch.Setting{Key: "allow_json_type", Value: "1"}
+	for name, value := range e.cfg.Settings {
+		opts.Settings = append(opts.Settings, ch.Setting{Key: name, Value: value})
 	}
 
 	c, err := ch.Dial(ctx, opts)
@@ -269,7 +302,7 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 	}
 
 	if err := e.db.Do(ctx, ch.Query{
-		Body:  "INSERT INTO otel_chgo.otel_logs VALUES",
+		Body:  e.insertSQL,
 		Input: e.insertInput,
 	}); err != nil {
 		_ = e.closeDB()
@@ -278,7 +311,7 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 	}
 
 	duration := time.Since(start)
-	e.logger.Info("insert logs", zap.Int("records", ld.LogRecordCount()),
+	e.logger.Debug("insert logs", zap.Int("records", ld.LogRecordCount()),
 		zap.String("cost", duration.String()))
 
 	return nil

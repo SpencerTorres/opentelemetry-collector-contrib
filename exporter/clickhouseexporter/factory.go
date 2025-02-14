@@ -9,6 +9,8 @@ import (
 	"context"
 	"fmt"
 	chlogs "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/logs"
+	"net/url"
+	"strconv"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
@@ -53,6 +55,52 @@ func createDefaultConfig() component.Config {
 	}
 }
 
+func logsConfigFromComponentConfig(cfg *Config) (*chlogs.LogsConfig, error) {
+	dsnURL, err := url.Parse(cfg.Endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", errConfigInvalidEndpoint, err.Error())
+	}
+
+	queryParams := dsnURL.Query()
+
+	secureStr := queryParams.Get("secure")
+	secure, err := strconv.ParseBool(secureStr)
+	if secureStr != "" && err != nil {
+		return nil, fmt.Errorf("fail parse secure param: %w", err)
+	}
+	queryParams.Del("secure")
+
+	compression := queryParams.Get("compress")
+	queryParams.Del("compress")
+	compressionLevelStr := queryParams.Get("compress_level")
+	compressionLevel, err := strconv.Atoi(compressionLevelStr)
+	if compressionLevelStr != "" && err != nil {
+		return nil, fmt.Errorf("fail parse compress_level param: %w", err)
+	}
+	queryParams.Del("compress_level")
+
+	settings := make(map[string]string, len(queryParams))
+	for key := range queryParams {
+		value := queryParams.Get(key)
+		settings[key] = value
+	}
+
+	logsCfg := chlogs.LogsConfig{
+		Address:          dsnURL.Host,
+		User:             cfg.Username,
+		Password:         string(cfg.Password),
+		Database:         cfg.Database,
+		Table:            cfg.LogsTableName,
+		Compression:      compression,
+		CompressionLevel: compressionLevel,
+		TLS:              secure,
+		ClientName:       "otel-chgo",
+		Settings:         settings,
+	}
+
+	return &logsCfg, nil
+}
+
 // createLogsExporter creates a new exporter for logs.
 // Logs are directly inserted into ClickHouse.
 func createLogsExporter(
@@ -61,7 +109,13 @@ func createLogsExporter(
 	cfg component.Config,
 ) (exporter.Logs, error) {
 	c := cfg.(*Config)
-	exporter, err := chlogs.NewLogsExporter(set.Logger)
+
+	logsCfg, err := logsConfigFromComponentConfig(c)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create clickhouse logs exporter config: %w", err)
+	}
+
+	exporter, err := chlogs.NewLogsExporter(logsCfg, set.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("cannot configure clickhouse logs exporter: %w", err)
 	}
@@ -77,6 +131,23 @@ func createLogsExporter(
 		exporterhelper.WithQueue(c.QueueSettings),
 		exporterhelper.WithRetry(c.BackOffConfig),
 	)
+
+	//exporter, err := newLogsExporter(set.Logger, c)
+	//if err != nil {
+	//	return nil, fmt.Errorf("cannot configure clickhouse logs exporter: %w", err)
+	//}
+	//
+	//return exporterhelper.NewLogs(
+	//	ctx,
+	//	set,
+	//	cfg,
+	//	exporter.pushLogsData,
+	//	exporterhelper.WithStart(exporter.start),
+	//	exporterhelper.WithShutdown(exporter.shutdown),
+	//	exporterhelper.WithTimeout(c.TimeoutSettings),
+	//	exporterhelper.WithQueue(c.QueueSettings),
+	//	exporterhelper.WithRetry(c.BackOffConfig),
+	//)
 }
 
 // createTracesExporter creates a new exporter for traces.

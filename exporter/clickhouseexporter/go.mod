@@ -3,8 +3,8 @@ module github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickh
 go 1.23.0
 
 require (
-	github.com/ClickHouse/ch-go v0.64.0
-	github.com/ClickHouse/clickhouse-go/v2 v2.31.0
+	github.com/ClickHouse/ch-go v0.65.0
+	github.com/ClickHouse/clickhouse-go/v2 v2.32.0
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal v0.119.0
@@ -34,7 +34,8 @@ require (
 	github.com/cpuguy83/dockercfg v0.3.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
-	github.com/docker/docker v27.4.1+incompatible // indirect
+	github.com/dmarkham/enumer v1.5.10 // indirect
+	github.com/docker/docker v27.5.1+incompatible // indirect
 	github.com/docker/go-connections v0.5.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
@@ -67,6 +68,7 @@ require (
 	github.com/morikuni/aec v1.0.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.0 // indirect
+	github.com/pascaldekloe/name v1.0.1 // indirect
 	github.com/paulmach/orb v0.11.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
@@ -102,11 +104,15 @@ require (
 	go.opentelemetry.io/otel/sdk/metric v1.34.0 // indirect
 	go.opentelemetry.io/otel/trace v1.34.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.3.1 // indirect
+	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.32.0 // indirect
+	golang.org/x/mod v0.18.0 // indirect
 	golang.org/x/net v0.34.0 // indirect
+	golang.org/x/sync v0.11.0 // indirect
 	golang.org/x/sys v0.29.0 // indirect
 	golang.org/x/text v0.22.0 // indirect
+	golang.org/x/tools v0.22.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20241202173237-19429a94021a // indirect
 	google.golang.org/grpc v1.70.0 // indirect
 	google.golang.org/protobuf v1.36.5 // indirect

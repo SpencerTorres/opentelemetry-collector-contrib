@@ -59,9 +59,10 @@ func (e *LogsExporter) connectDB(ctx context.Context) error {
 	_ = e.closeDB()
 
 	opts := ch.Options{
-		Address:     "127.0.0.1:9000",
-		Database:    "otel_chgo",
-		Compression: ch.CompressionLZ4,
+		Address:          "127.0.0.1:9000",
+		Database:         "otel_chgo",
+		Compression:      ch.CompressionLZ4,
+		CompressionLevel: 3,
 		Settings: []ch.Setting{
 			{Key: "allow_json_type", Value: "1"},
 		},

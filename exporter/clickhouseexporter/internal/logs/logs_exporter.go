@@ -17,8 +17,10 @@ import (
 )
 
 type LogsExporter struct {
-	logger       *zap.Logger
-	db           *ch.Client
+	logger *zap.Logger
+
+	db *ch.Client
+
 	maxBatchSize int
 	columns      *logColumns
 	insertInput  proto.Input
@@ -53,12 +55,13 @@ func NewLogsExporter(logger *zap.Logger) (*LogsExporter, error) {
 	}, nil
 }
 
-func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
+func (e *LogsExporter) connectDB(ctx context.Context) error {
+	_ = e.closeDB()
+
 	opts := ch.Options{
-		Address:     "localhost:9000",
+		Address:     "127.0.0.1:9000",
 		Database:    "otel_chgo",
 		Compression: ch.CompressionLZ4,
-
 		Settings: []ch.Setting{
 			{Key: "allow_json_type", Value: "1"},
 		},
@@ -66,9 +69,37 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 
 	c, err := ch.Dial(ctx, opts)
 	if err != nil {
-		panic(err)
+		return fmt.Errorf("chgo dial: %w", err)
 	}
 	e.db = c
+
+	e.logger.Info("ClickHouse connected")
+
+	return nil
+}
+
+func (e *LogsExporter) closeDB() error {
+	if e.db == nil {
+		return nil
+	}
+
+	err := e.db.Close()
+	e.db = nil
+	if err != nil {
+		return fmt.Errorf("chgo close: %w", err)
+	}
+
+	e.logger.Info("ClickHouse disconnected")
+
+	return nil
+}
+
+func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
+	err := e.connectDB(ctx)
+	if err != nil {
+		_ = e.closeDB()
+		e.logger.Error(fmt.Sprintf("initial connection failed: %s", err))
+	}
 
 	jsonSize := 512
 	strSize := 64
@@ -169,10 +200,16 @@ func newLowCardinalityString(strSize, bufSize int) *proto.ColLowCardinality[stri
 }
 
 func (e *LogsExporter) Shutdown(_ context.Context) error {
-	return e.db.Close()
+	return e.closeDB()
 }
 
 func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
+	if e.db == nil {
+		if err := e.connectDB(ctx); err != nil {
+			return err
+		}
+	}
+
 	cols := e.columns
 	e.insertInput.Reset()
 
@@ -200,7 +237,8 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 			e.scopeAttributesJSONBuffer.Reset()
 			attributesToJSON(e.scopeAttributesJSONBuffer, scopeLogScope.Attributes())
 
-			for k := 0; k < scopeLogRecords.Len(); k++ {
+			slrLen := scopeLogRecords.Len()
+			for k := 0; k < slrLen; k++ {
 				r := scopeLogRecords.At(k)
 				e.logAttributesJSONBuffer.Reset()
 				attributesToJSON(e.logAttributesJSONBuffer, r.Attributes())
@@ -211,18 +249,18 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 				}
 
 				cols.timestamp.Append(proto.DateTime64(timestamp))
+				cols.scopeName.Append(scopeName)
+				cols.body.Append(r.Body().Str())
 				cols.traceID.Append(traceutil.TraceIDToHexOrEmptyString(r.TraceID()))
 				cols.spanID.Append(traceutil.SpanIDToHexOrEmptyString(r.SpanID()))
 				cols.traceFlags.Append(uint8(r.Flags()))
-				cols.severityText.Append(r.SeverityText())
 				cols.severityNumber.Append(uint8(r.SeverityNumber()))
 				cols.serviceName.Append(serviceName)
-				cols.body.Append(r.Body().AsString())
 				cols.resourceSchemaUrl.Append(resURL)
-				cols.resourceAttributes.Append(e.resourceAttributesJSONBuffer.Bytes())
 				cols.scopeSchemaUrl.Append(scopeURL)
-				cols.scopeName.Append(scopeName)
 				cols.scopeVersion.Append(scopeVersion)
+				cols.severityText.Append(r.SeverityText())
+				cols.resourceAttributes.Append(e.resourceAttributesJSONBuffer.Bytes())
 				cols.scopeAttributes.Append(e.scopeAttributesJSONBuffer.Bytes())
 				cols.logAttributes.Append(e.logAttributesJSONBuffer.Bytes())
 			}
@@ -233,7 +271,9 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 		Body:  "INSERT INTO otel_chgo.otel_logs VALUES",
 		Input: e.insertInput,
 	}); err != nil {
-		return fmt.Errorf("chgo Do: %w", err)
+		_ = e.closeDB()
+
+		return fmt.Errorf("chgo insert: %w", err)
 	}
 
 	duration := time.Since(start)

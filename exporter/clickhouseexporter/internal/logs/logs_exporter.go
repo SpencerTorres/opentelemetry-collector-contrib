@@ -217,16 +217,16 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 	}
 
 	e.resourceAttributesJSONBuffer = &JSONBuffer{
-		buf:          make([]byte, 0, 4096),
-		base64Buffer: make([]byte, 0, 1024),
+		buf:          make([]byte, 0, jsonSize),
+		base64Buffer: make([]byte, 0, strSize),
 	}
 	e.scopeAttributesJSONBuffer = &JSONBuffer{
-		buf:          make([]byte, 0, 4096),
-		base64Buffer: make([]byte, 0, 1024),
+		buf:          make([]byte, 0, jsonSize),
+		base64Buffer: make([]byte, 0, strSize),
 	}
 	e.logAttributesJSONBuffer = &JSONBuffer{
-		buf:          make([]byte, 0, 4096),
-		base64Buffer: make([]byte, 0, 1024),
+		buf:          make([]byte, 0, jsonSize),
+		base64Buffer: make([]byte, 0, strSize),
 	}
 
 	return nil

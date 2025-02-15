@@ -258,6 +258,7 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 
 	start := time.Now()
 
+	var logCount int
 	rsLogs := ld.ResourceLogs()
 	rsLen := rsLogs.Len()
 	for i := 0; i < rsLen; i++ {
@@ -306,6 +307,8 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 				cols.resourceAttributes.Append(e.resourceAttributesJSONBuffer.Bytes())
 				cols.scopeAttributes.Append(e.scopeAttributesJSONBuffer.Bytes())
 				cols.logAttributes.Append(e.logAttributesJSONBuffer.Bytes())
+
+				logCount++
 			}
 		}
 	}
@@ -320,7 +323,7 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 	}
 
 	duration := time.Since(start)
-	e.logger.Debug("insert logs", zap.Int("records", ld.LogRecordCount()),
+	e.logger.Debug("insert logs", zap.Int("records", logCount),
 		zap.String("cost", duration.String()))
 
 	return nil

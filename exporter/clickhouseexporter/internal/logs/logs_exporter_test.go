@@ -49,26 +49,43 @@ func testMap() pcommon.Map {
 	memAllocs.AppendEmpty().SetInt(2048)
 	memAllocs.AppendEmpty().SetInt(4096)
 
+	secretBytes := attrs.PutEmptyBytes("secret")
+	for i := 0; i < 10; i++ {
+		secretBytes.Append(0xA, 0xB, 0xC, 0xD)
+	}
+
 	return attrs
 }
 
 func TestAttributesToJSON(t *testing.T) {
 	m := testMap()
 
-	secretBytes := m.PutEmptyBytes("secret")
-	secretBytes.Append(0xA, 0xB, 0xC)
+	jb := JSONBuffer{
+		buf:          make([]byte, 0, 1024),
+		base64Buffer: make([]byte, 0, 128),
+	}
 
-	jb := JSONBuffer{buf: make([]byte, 0, 1024)}
+	attributesToJSON(&jb, m)
+	// Verify resetting correctly encodes the right output, including base64 buffer
+	jb.Reset()
 	attributesToJSON(&jb, m)
 
 	actual := string(jb.Bytes())
-	expected := `{"app":"telemetry-service","process.pid":12345,"debug.enabled":true,"request_id":null,"server.info":{"hostname":"prod-server-01","uptime":156.7,"metadata":{"region":"us-west-2","tier":"premium"}},"user.roles":["admin","editor","viewer"],"system.metrics":[0.75,0.83,0.3335],"resource.usage":{"cpu":{"cores":8,"loads":[1.5,2,1.8]},"memory":{"total":16384,"used":8192,"allocations":[1024,2048,4096]}},"secret":"CgsM"}`
+	expected := `{"app":"telemetry-service","process.pid":12345,"debug.enabled":true,"request_id":null,` +
+		`"server.info":{"hostname":"prod-server-01","uptime":156.7,"metadata":{"region":"us-west-2",` +
+		`"tier":"premium"}},"user.roles":["admin","editor","viewer"],"system.metrics":[0.75,0.83,0.3335],` +
+		`"resource.usage":{"cpu":{"cores":8,"loads":[1.5,2,1.8]},"memory":{"total":16384,"used":8192,` +
+		`"allocations":[1024,2048,4096]}},"secret":"CgsMDQoLDA0KCwwNCgsMDQoLDA0KCwwNCgsMDQoLDA0KCwwNCgsMDQ=="}`
+
 	require.Equal(t, expected, actual)
 }
 
 func BenchmarkAttributesToJSON(b *testing.B) {
 	m := testMap()
-	jb := JSONBuffer{buf: make([]byte, 0, 1024)}
+	jb := JSONBuffer{
+		buf:          make([]byte, 0, 1024),
+		base64Buffer: make([]byte, 0, 128),
+	}
 
 	b.ReportAllocs()
 	b.ResetTimer()

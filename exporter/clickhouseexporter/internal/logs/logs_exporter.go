@@ -216,9 +216,18 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 		{Name: "LogAttributes", Data: &cols.logAttributes},
 	}
 
-	e.resourceAttributesJSONBuffer = &JSONBuffer{buf: make([]byte, 0, 8192)}
-	e.scopeAttributesJSONBuffer = &JSONBuffer{buf: make([]byte, 0, 8192)}
-	e.logAttributesJSONBuffer = &JSONBuffer{buf: make([]byte, 0, 8192)}
+	e.resourceAttributesJSONBuffer = &JSONBuffer{
+		buf:          make([]byte, 0, 4096),
+		base64Buffer: make([]byte, 0, 1024),
+	}
+	e.scopeAttributesJSONBuffer = &JSONBuffer{
+		buf:          make([]byte, 0, 4096),
+		base64Buffer: make([]byte, 0, 1024),
+	}
+	e.logAttributesJSONBuffer = &JSONBuffer{
+		buf:          make([]byte, 0, 4096),
+		base64Buffer: make([]byte, 0, 1024),
+	}
 
 	return nil
 }
@@ -389,8 +398,8 @@ func serializeSlice(b *JSONBuffer, s pcommon.Slice) {
 }
 
 func serializeBytesBase64(b *JSONBuffer, bs pcommon.ByteSlice) {
-	raw := bs.AsRaw()
-	n := base64.StdEncoding.EncodedLen(len(raw))
+	b.base64Buffer = copyByteSlice(b.base64Buffer, bs)
+	n := base64.StdEncoding.EncodedLen(len(b.base64Buffer))
 
 	start := len(b.buf)
 	b.grow(n + 2)
@@ -398,15 +407,30 @@ func serializeBytesBase64(b *JSONBuffer, bs pcommon.ByteSlice) {
 	b.buf = append(b.buf, '"')
 
 	dst := b.buf[start+1 : start+1+n]
-	base64.StdEncoding.Encode(dst, raw)
+	base64.StdEncoding.Encode(dst, b.base64Buffer)
 	b.buf = b.buf[:start+1+n]
 
 	b.buf = append(b.buf, '"')
 }
 
+// copyByteSlice copies the data from the ByteSlice into the dst.
+// There's no way to simply get the underlying *[]byte, unfortunately
+// Removes an allocation in exchange for CPU
+func copyByteSlice(dst []byte, bs pcommon.ByteSlice) []byte {
+	dst = dst[:0]
+
+	bsLen := bs.Len()
+	for i := 0; i < bsLen; i++ {
+		dst = append(dst, bs.At(i))
+	}
+
+	return dst
+}
+
 // JSONBuffer is a reusable buffer for faster JSON serialization
 type JSONBuffer struct {
-	buf []byte
+	buf          []byte
+	base64Buffer []byte // TODO: this shouldn't go here
 }
 
 func (b *JSONBuffer) Reset() {

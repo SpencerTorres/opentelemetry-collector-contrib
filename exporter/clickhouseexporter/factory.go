@@ -8,7 +8,7 @@ package clickhouseexporter // import "github.com/open-telemetry/opentelemetry-co
 import (
 	"context"
 	"fmt"
-	chlogs "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/logs"
+	chgo "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/chgo"
 	"net/url"
 	"strconv"
 	"time"
@@ -55,7 +55,7 @@ func createDefaultConfig() component.Config {
 	}
 }
 
-func logsConfigFromComponentConfig(cfg *Config) (*chlogs.LogsConfig, error) {
+func chConfigFromComponentConfig(cfg *Config, traces bool) (*chgo.ChConfig, error) {
 	dsnURL, err := url.Parse(cfg.Endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", errConfigInvalidEndpoint, err.Error())
@@ -85,12 +85,17 @@ func logsConfigFromComponentConfig(cfg *Config) (*chlogs.LogsConfig, error) {
 		settings[key] = value
 	}
 
-	logsCfg := chlogs.LogsConfig{
+	table := cfg.LogsTableName
+	if traces {
+		table = cfg.TracesTableName
+	}
+
+	chCfg := chgo.ChConfig{
 		Address:          dsnURL.Host,
 		User:             cfg.Username,
 		Password:         string(cfg.Password),
 		Database:         cfg.Database,
-		Table:            cfg.LogsTableName,
+		Table:            table,
 		Compression:      compression,
 		CompressionLevel: compressionLevel,
 		TLS:              secure,
@@ -98,7 +103,7 @@ func logsConfigFromComponentConfig(cfg *Config) (*chlogs.LogsConfig, error) {
 		Settings:         settings,
 	}
 
-	return &logsCfg, nil
+	return &chCfg, nil
 }
 
 // createLogsExporter creates a new exporter for logs.
@@ -110,12 +115,12 @@ func createLogsExporter(
 ) (exporter.Logs, error) {
 	c := cfg.(*Config)
 
-	logsCfg, err := logsConfigFromComponentConfig(c)
+	chCfg, err := chConfigFromComponentConfig(c, false)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create clickhouse logs exporter config: %w", err)
 	}
 
-	exporter, err := chlogs.NewLogsExporter(logsCfg, set.Logger)
+	exporter, err := chgo.NewLogsExporter(chCfg, set.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("cannot configure clickhouse logs exporter: %w", err)
 	}

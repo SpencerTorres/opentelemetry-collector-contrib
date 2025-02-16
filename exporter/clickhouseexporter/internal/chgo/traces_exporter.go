@@ -118,13 +118,13 @@ func (e *TracesExporter) Start(ctx context.Context, _ component.Host) error {
 		{Name: "Duration", Data: &cols.duration},
 		{Name: "StatusCode", Data: cols.statusCode},
 		{Name: "StatusMessage", Data: &cols.statusMessage},
-		//{Name: "Events.Timestamp", Data: cols.eventsTimestamps},
-		//{Name: "Events.Name", Data: cols.eventsNames},
-		//{Name: "Events.Attributes", Data: cols.eventsAttributes},
-		//{Name: "Links.TraceId", Data: cols.linksTraceIDs},
-		//{Name: "Links.SpanId", Data: cols.linksSpanIDs},
-		//{Name: "Links.TraceState", Data: cols.linksTraceStates},
-		//{Name: "Links.Attributes", Data: cols.linksAttributes},
+		{Name: "Events.Timestamp", Data: cols.eventsTimestamps},
+		{Name: "Events.Name", Data: cols.eventsNames},
+		{Name: "Events.Attributes", Data: cols.eventsAttributes},
+		{Name: "Links.TraceId", Data: cols.linksTraceIDs},
+		{Name: "Links.SpanId", Data: cols.linksSpanIDs},
+		{Name: "Links.TraceState", Data: cols.linksTraceStates},
+		{Name: "Links.Attributes", Data: cols.linksAttributes},
 	}
 
 	e.resourceAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
@@ -193,16 +193,8 @@ func (e *TracesExporter) PushTraceData(ctx context.Context, td ptrace.Traces) er
 				cols.duration.Append(uint64(span.EndTimestamp() - span.StartTimestamp()))
 				cols.statusCode.Append(spanStatus.Code().String())
 				cols.statusMessage.Append(spanStatus.Message())
-
-				cols.eventsTimestamps.Append([]proto.DateTime64{})
-				cols.eventsNames.Append([]string{})
-				cols.eventsAttributes.Append([][]byte{})
-				cols.linksTraceIDs.Append([]string{})
-				cols.linksSpanIDs.Append([]string{})
-				cols.linksTraceStates.Append([]string{})
-				cols.linksAttributes.Append([][]byte{})
-				//appendEvents(cols.eventsTimestamps, cols.eventsNames, e.eventsAttributesJSONBuffer, cols.eventsAttributes, span.Events())
-				//appendLinks(cols.linksTraceIDs, cols.linksSpanIDs, cols.linksTraceStates, e.linksAttributesJSONBuffer, cols.linksAttributes, span.Links())
+				appendEvents(cols.eventsTimestamps, cols.eventsNames, e.eventsAttributesJSONBuffer, cols.eventsAttributes, span.Events())
+				appendLinks(cols.linksTraceIDs, cols.linksSpanIDs, cols.linksTraceStates, e.linksAttributesJSONBuffer, cols.linksAttributes, span.Links())
 
 				spanCount++
 			}
@@ -238,10 +230,6 @@ func appendEvents(times *proto.ColArr[proto.DateTime64], names *proto.ColArr[str
 		attrs.Data.Append(attrBuf.Bytes())
 	}
 
-	if eLen == 0 {
-		return
-	}
-
 	times.Offsets = append(times.Offsets, uint64(times.Data.Rows()))
 	names.Offsets = append(names.Offsets, uint64(names.Data.Rows()))
 	attrs.Offsets = append(attrs.Offsets, uint64(attrs.Data.Rows()))
@@ -259,10 +247,6 @@ func appendLinks(traceIDs, spanIDs, states *proto.ColArr[string], attrBuf *JSONB
 		attrBuf.Reset()
 		attributesToJSON(attrBuf, link.Attributes())
 		attrs.Data.Append(attrBuf.Bytes())
-	}
-
-	if lLen == 0 {
-		return
 	}
 
 	traceIDs.Offsets = append(traceIDs.Offsets, uint64(traceIDs.Data.Rows()))

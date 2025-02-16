@@ -163,7 +163,13 @@ func createTracesExporter(
 	cfg component.Config,
 ) (exporter.Traces, error) {
 	c := cfg.(*Config)
-	exporter, err := newTracesExporter(set.Logger, c)
+
+	chCfg, err := chConfigFromComponentConfig(c, true)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create clickhouse traces exporter config: %w", err)
+	}
+
+	exporter, err := chgo.NewTracesExporter(chCfg, set.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("cannot configure clickhouse traces exporter: %w", err)
 	}
@@ -172,13 +178,30 @@ func createTracesExporter(
 		ctx,
 		set,
 		cfg,
-		exporter.pushTraceData,
-		exporterhelper.WithStart(exporter.start),
-		exporterhelper.WithShutdown(exporter.shutdown),
+		exporter.PushTraceData,
+		exporterhelper.WithStart(exporter.Start),
+		exporterhelper.WithShutdown(exporter.Shutdown),
 		exporterhelper.WithTimeout(c.TimeoutSettings),
 		exporterhelper.WithQueue(c.QueueSettings),
 		exporterhelper.WithRetry(c.BackOffConfig),
 	)
+
+	//exporter, err := newTracesExporter(set.Logger, c)
+	//if err != nil {
+	//	return nil, fmt.Errorf("cannot configure clickhouse traces exporter: %w", err)
+	//}
+	//
+	//return exporterhelper.NewTraces(
+	//	ctx,
+	//	set,
+	//	cfg,
+	//	exporter.pushTraceData,
+	//	exporterhelper.WithStart(exporter.start),
+	//	exporterhelper.WithShutdown(exporter.shutdown),
+	//	exporterhelper.WithTimeout(c.TimeoutSettings),
+	//	exporterhelper.WithQueue(c.QueueSettings),
+	//	exporterhelper.WithRetry(c.BackOffConfig),
+	//)
 }
 
 func createMetricExporter(

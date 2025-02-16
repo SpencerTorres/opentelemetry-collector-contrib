@@ -6,6 +6,13 @@ import (
 	"strconv"
 )
 
+func newJSONBuffer(jsonSize, base64Size int) *JSONBuffer {
+	return &JSONBuffer{
+		buf:          make([]byte, 0, jsonSize),
+		base64Buffer: make([]byte, 0, base64Size),
+	}
+}
+
 // attributesToJSON serializes attributes to JSON using a reusable buffer
 func attributesToJSON(b *JSONBuffer, m pcommon.Map) {
 	if m.Len() == 0 {

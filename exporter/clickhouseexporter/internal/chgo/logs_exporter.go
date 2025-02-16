@@ -68,61 +68,21 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 	bSize := e.maxBatchSize
 
 	cols := &logColumns{
-		timestamp: proto.ColDateTime64Raw{
-			ColDateTime64: proto.ColDateTime64{
-				Data:         make([]proto.DateTime64, 0, bSize),
-				Location:     time.UTC,
-				Precision:    proto.PrecisionNano,
-				PrecisionSet: true,
-			},
-		},
-		traceID: proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		},
-		spanID: proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		},
-		traceFlags:     make(proto.ColUInt8, 0, bSize),
-		severityText:   newLowCardinalityString(strSize, bSize),
-		severityNumber: make(proto.ColUInt8, 0, bSize),
-		serviceName:    newLowCardinalityString(strSize, bSize),
-		body: proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		},
-		resourceSchemaUrl: newLowCardinalityString(strSize, bSize),
-		resourceAttributes: proto.ColJSONBytes{
-			ColJSONStr: proto.ColJSONStr{
-				Str: proto.ColStr{
-					Buf: make([]byte, 0, jsonSize*bSize),
-					Pos: make([]proto.Position, 0, bSize),
-				},
-			},
-		},
-		scopeSchemaUrl: newLowCardinalityString(strSize, bSize),
-		scopeName: proto.ColStr{
-			Buf: make([]byte, 0, strSize*bSize),
-			Pos: make([]proto.Position, 0, bSize),
-		},
-		scopeVersion: newLowCardinalityString(strSize, bSize),
-		scopeAttributes: proto.ColJSONBytes{
-			ColJSONStr: proto.ColJSONStr{
-				Str: proto.ColStr{
-					Buf: make([]byte, 0, jsonSize*bSize),
-					Pos: make([]proto.Position, 0, bSize),
-				},
-			},
-		},
-		logAttributes: proto.ColJSONBytes{
-			ColJSONStr: proto.ColJSONStr{
-				Str: proto.ColStr{
-					Buf: make([]byte, 0, jsonSize*bSize),
-					Pos: make([]proto.Position, 0, bSize),
-				},
-			},
-		},
+		timestamp:          newColDateTime64Raw(bSize),
+		traceID:            newColString(strSize, bSize),
+		spanID:             newColString(strSize, bSize),
+		traceFlags:         make(proto.ColUInt8, 0, bSize),
+		severityText:       newColLowCardinalityString(strSize, bSize),
+		severityNumber:     make(proto.ColUInt8, 0, bSize),
+		serviceName:        newColLowCardinalityString(strSize, bSize),
+		body:               newColString(strSize, bSize),
+		resourceSchemaUrl:  newColLowCardinalityString(strSize, bSize),
+		resourceAttributes: newColJSONBytes(jsonSize, strSize),
+		scopeSchemaUrl:     newColLowCardinalityString(strSize, bSize),
+		scopeName:          newColString(strSize, bSize),
+		scopeVersion:       newColLowCardinalityString(strSize, bSize),
+		scopeAttributes:    newColJSONBytes(jsonSize, strSize),
+		logAttributes:      newColJSONBytes(jsonSize, strSize),
 	}
 	e.columns = cols
 
@@ -144,18 +104,9 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 		{Name: "LogAttributes", Data: &cols.logAttributes},
 	}
 
-	e.resourceAttributesJSONBuffer = &JSONBuffer{
-		buf:          make([]byte, 0, jsonSize),
-		base64Buffer: make([]byte, 0, strSize),
-	}
-	e.scopeAttributesJSONBuffer = &JSONBuffer{
-		buf:          make([]byte, 0, jsonSize),
-		base64Buffer: make([]byte, 0, strSize),
-	}
-	e.logAttributesJSONBuffer = &JSONBuffer{
-		buf:          make([]byte, 0, jsonSize),
-		base64Buffer: make([]byte, 0, strSize),
-	}
+	e.resourceAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
+	e.scopeAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
+	e.logAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
 
 	return nil
 }
@@ -237,7 +188,7 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 	}); err != nil {
 		_ = closeDB(&e.db)
 
-		return fmt.Errorf("chgo insert: %w", err)
+		return fmt.Errorf("chgo logs insert: %w", err)
 	}
 
 	duration := time.Since(start)

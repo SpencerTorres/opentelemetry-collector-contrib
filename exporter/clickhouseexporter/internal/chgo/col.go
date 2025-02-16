@@ -1,13 +1,65 @@
 package chgo
 
-import "github.com/ClickHouse/ch-go/proto"
+import (
+	"github.com/ClickHouse/ch-go/proto"
+	"time"
+)
 
-func newLowCardinalityString(strSize, bufSize int) *proto.ColLowCardinality[string] {
+func newColLowCardinalityString(strSize, batchSize int) *proto.ColLowCardinality[string] {
 	lc := proto.NewLowCardinality[string](&proto.ColStr{
-		Buf: make([]byte, 0, strSize*bufSize),
-		Pos: make([]proto.Position, 0, bufSize),
+		Buf: make([]byte, 0, strSize*batchSize),
+		Pos: make([]proto.Position, 0, batchSize),
 	})
-	lc.Values = make([]string, 0, bufSize)
+	lc.Values = make([]string, 0, batchSize)
 
 	return lc
+}
+
+func newColArrayLowCardinalityString(strSize, batchSize int) *proto.ColArr[string] {
+	col := newColLowCardinalityString(strSize, batchSize)
+	return &proto.ColArr[string]{Data: col}
+}
+
+func newColString(strSize, batchSize int) proto.ColStr {
+	return proto.ColStr{
+		Buf: make([]byte, 0, strSize*batchSize),
+		Pos: make([]proto.Position, 0, batchSize),
+	}
+}
+
+func newColArrayString(strSize, batchSize int) *proto.ColArr[string] {
+	col := newColString(strSize, batchSize)
+	return &proto.ColArr[string]{Data: &col}
+}
+
+func newColJSONBytes(jsonSize, batchSize int) proto.ColJSONBytes {
+	return proto.ColJSONBytes{
+		ColJSONStr: proto.ColJSONStr{
+			Str: proto.ColStr{
+				Buf: make([]byte, 0, jsonSize*batchSize),
+				Pos: make([]proto.Position, 0, batchSize),
+			},
+		},
+	}
+}
+
+func newColArrayJSONBytes(jsonSize, batchSize int) *proto.ColArr[[]byte] {
+	col := newColJSONBytes(jsonSize, batchSize)
+	return &proto.ColArr[[]byte]{Data: &col}
+}
+
+func newColDateTime64Raw(batchSize int) proto.ColDateTime64Raw {
+	return proto.ColDateTime64Raw{
+		ColDateTime64: proto.ColDateTime64{
+			Data:         make([]proto.DateTime64, 0, batchSize),
+			Location:     time.UTC,
+			Precision:    proto.PrecisionNano,
+			PrecisionSet: true,
+		},
+	}
+}
+
+func newColArrayDateTime64Raw(batchSize int) *proto.ColArr[proto.DateTime64] {
+	col := newColDateTime64Raw(batchSize)
+	return &proto.ColArr[proto.DateTime64]{Data: &col}
 }

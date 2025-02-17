@@ -6,7 +6,6 @@ import (
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.uber.org/zap"
@@ -28,13 +27,15 @@ type TracesExporter struct {
 	spanAttributesJSONBuffer     *JSONBuffer
 	eventsAttributesJSONBuffer   *JSONBuffer
 	linksAttributesJSONBuffer    *JSONBuffer
+
+	hexEncodeBuffer []byte
 }
 
 type traceColumns struct {
 	timestamp          proto.ColDateTime64Raw
-	traceID            proto.ColStr
-	spanID             proto.ColStr
-	parentSpanID       proto.ColStr
+	traceID            proto.ColBytes
+	spanID             proto.ColBytes
+	parentSpanID       proto.ColBytes
 	traceState         proto.ColStr
 	spanName           *proto.ColLowCardinality[string]
 	spanKind           *proto.ColLowCardinality[string]
@@ -50,8 +51,8 @@ type traceColumns struct {
 	eventsTimestamps *proto.ColArr[proto.DateTime64]
 	eventsNames      *proto.ColArr[string]
 	eventsAttributes *proto.ColArr[[]byte]
-	linksTraceIDs    *proto.ColArr[string]
-	linksSpanIDs     *proto.ColArr[string]
+	linksTraceIDs    *proto.ColArr[[]byte]
+	linksSpanIDs     *proto.ColArr[[]byte]
 	linksTraceStates *proto.ColArr[string]
 	linksAttributes  *proto.ColArr[[]byte]
 }
@@ -78,9 +79,9 @@ func (e *TracesExporter) Start(ctx context.Context, _ component.Host) error {
 
 	cols := &traceColumns{
 		timestamp:          newColDateTime64Raw(bSize),
-		traceID:            newColString(strSize, bSize),
-		spanID:             newColString(strSize, bSize),
-		parentSpanID:       newColString(strSize, bSize),
+		traceID:            newColBytes(strSize, bSize),
+		spanID:             newColBytes(strSize, bSize),
+		parentSpanID:       newColBytes(strSize, bSize),
 		traceState:         newColString(strSize, bSize),
 		spanName:           newColLowCardinalityString(strSize, bSize),
 		spanKind:           newColLowCardinalityString(strSize, bSize),
@@ -95,8 +96,8 @@ func (e *TracesExporter) Start(ctx context.Context, _ component.Host) error {
 		eventsTimestamps:   newColArrayDateTime64Raw(bSize),
 		eventsNames:        newColArrayLowCardinalityString(strSize, bSize),
 		eventsAttributes:   newColArrayJSONBytes(jsonSize, bSize),
-		linksTraceIDs:      newColArrayString(strSize, bSize),
-		linksSpanIDs:       newColArrayString(strSize, bSize),
+		linksTraceIDs:      newColArrayBytes(strSize, bSize),
+		linksSpanIDs:       newColArrayBytes(strSize, bSize),
 		linksTraceStates:   newColArrayString(strSize, bSize),
 		linksAttributes:    newColArrayJSONBytes(jsonSize, bSize),
 	}
@@ -131,6 +132,8 @@ func (e *TracesExporter) Start(ctx context.Context, _ component.Host) error {
 	e.spanAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
 	e.eventsAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
 	e.linksAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
+
+	e.hexEncodeBuffer = make([]byte, 0, 128)
 
 	return nil
 }
@@ -179,9 +182,12 @@ func (e *TracesExporter) PushTraceData(ctx context.Context, td ptrace.Traces) er
 				attributesToJSON(e.spanAttributesJSONBuffer, span.Attributes())
 
 				cols.timestamp.Append(proto.DateTime64(span.StartTimestamp()))
-				cols.traceID.Append(traceutil.TraceIDToHexOrEmptyString(span.TraceID()))
-				cols.spanID.Append(traceutil.SpanIDToHexOrEmptyString(span.SpanID()))
-				cols.parentSpanID.Append(traceutil.SpanIDToHexOrEmptyString(span.ParentSpanID()))
+				e.hexEncodeBuffer = appendTraceIDToHex(e.hexEncodeBuffer[:0], span.TraceID())
+				cols.traceID.Append(e.hexEncodeBuffer)
+				e.hexEncodeBuffer = appendSpanIDToHex(e.hexEncodeBuffer[:0], span.SpanID())
+				cols.spanID.Append(e.hexEncodeBuffer)
+				e.hexEncodeBuffer = appendSpanIDToHex(e.hexEncodeBuffer[:0], span.ParentSpanID())
+				cols.parentSpanID.Append(e.hexEncodeBuffer)
 				cols.traceState.Append(span.TraceState().AsRaw())
 				cols.spanName.Append(span.Name())
 				cols.spanKind.Append(span.Kind().String())
@@ -194,7 +200,7 @@ func (e *TracesExporter) PushTraceData(ctx context.Context, td ptrace.Traces) er
 				cols.statusCode.Append(spanStatus.Code().String())
 				cols.statusMessage.Append(spanStatus.Message())
 				appendEvents(cols.eventsTimestamps, cols.eventsNames, e.eventsAttributesJSONBuffer, cols.eventsAttributes, span.Events())
-				appendLinks(cols.linksTraceIDs, cols.linksSpanIDs, cols.linksTraceStates, e.linksAttributesJSONBuffer, cols.linksAttributes, span.Links())
+				appendLinks(cols.linksTraceIDs, cols.linksSpanIDs, cols.linksTraceStates, e.hexEncodeBuffer, e.linksAttributesJSONBuffer, cols.linksAttributes, span.Links())
 
 				spanCount++
 			}
@@ -235,13 +241,15 @@ func appendEvents(times *proto.ColArr[proto.DateTime64], names *proto.ColArr[str
 	attrs.Offsets = append(attrs.Offsets, uint64(attrs.Data.Rows()))
 }
 
-func appendLinks(traceIDs, spanIDs, states *proto.ColArr[string], attrBuf *JSONBuffer, attrs *proto.ColArr[[]byte], links ptrace.SpanLinkSlice) {
+func appendLinks(traceIDs, spanIDs *proto.ColArr[[]byte], states *proto.ColArr[string], hexEncodeBuffer []byte, attrBuf *JSONBuffer, attrs *proto.ColArr[[]byte], links ptrace.SpanLinkSlice) {
 	lLen := links.Len()
 	for i := 0; i < lLen; i++ {
 		link := links.At(i)
 
-		traceIDs.Data.Append(traceutil.TraceIDToHexOrEmptyString(link.TraceID()))
-		spanIDs.Data.Append(traceutil.SpanIDToHexOrEmptyString(link.SpanID()))
+		hexEncodeBuffer = appendTraceIDToHex(hexEncodeBuffer[:0], link.TraceID())
+		traceIDs.Data.Append(hexEncodeBuffer)
+		hexEncodeBuffer = appendSpanIDToHex(hexEncodeBuffer[:0], link.SpanID())
+		spanIDs.Data.Append(hexEncodeBuffer)
 		states.Data.Append(link.TraceState().AsRaw())
 
 		attrBuf.Reset()

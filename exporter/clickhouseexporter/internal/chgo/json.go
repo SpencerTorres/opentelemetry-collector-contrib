@@ -2,9 +2,30 @@ package chgo
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"strconv"
 )
+
+// appendSpanIDToHex writes a hex encoded byte slice of SpanID.
+// If SpanID is empty dst is returned with zero length.
+func appendSpanIDToHex(dst []byte, id pcommon.SpanID) []byte {
+	if id.IsEmpty() {
+		return dst[:0]
+	}
+
+	return hex.AppendEncode(dst, id[:])
+}
+
+// appendTraceIDToHex writes a hex encoded byte slice of TraceID.
+// If TraceID is empty dst is returned with zero length.
+func appendTraceIDToHex(dst []byte, id pcommon.TraceID) []byte {
+	if id.IsEmpty() {
+		return dst[:0]
+	}
+
+	return hex.AppendEncode(dst, id[:])
+}
 
 func newJSONBuffer(jsonSize, base64Size int) *JSONBuffer {
 	return &JSONBuffer{

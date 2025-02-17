@@ -80,6 +80,38 @@ func TestAttributesToJSON(t *testing.T) {
 	require.Equal(t, expected, actual)
 }
 
+func TestAppendTraceIDToHex(t *testing.T) {
+	hexBuf := make([]byte, 0, 128)
+
+	var traceID = pcommon.TraceID{
+		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+		0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+	}
+
+	var actual string
+	for i := 0; i < 10; i++ {
+		hexBuf = appendTraceIDToHex(hexBuf[:0], traceID)
+		actual = string(hexBuf)
+	}
+
+	require.Equal(t, "00112233445566778899aabbccddeeff", actual)
+}
+
+func BenchmarkAppendTraceIDToHex(b *testing.B) {
+	hexBuf := make([]byte, 0, 128)
+
+	var traceID = pcommon.TraceID{
+		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+		0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		hexBuf = appendTraceIDToHex(hexBuf[:0], traceID)
+	}
+}
+
 func BenchmarkAttributesToJSON(b *testing.B) {
 	m := testMap()
 	jb := JSONBuffer{

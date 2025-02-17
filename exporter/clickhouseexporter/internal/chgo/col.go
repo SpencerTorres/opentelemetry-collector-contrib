@@ -17,7 +17,10 @@ func newColLowCardinalityString(strSize, batchSize int) *proto.ColLowCardinality
 
 func newColArrayLowCardinalityString(strSize, batchSize int) *proto.ColArr[string] {
 	col := newColLowCardinalityString(strSize, batchSize)
-	return &proto.ColArr[string]{Data: col}
+	return &proto.ColArr[string]{
+		Offsets: make(proto.ColUInt64, 0, batchSize),
+		Data:    col,
+	}
 }
 
 func newColString(strSize, batchSize int) proto.ColStr {
@@ -29,7 +32,24 @@ func newColString(strSize, batchSize int) proto.ColStr {
 
 func newColArrayString(strSize, batchSize int) *proto.ColArr[string] {
 	col := newColString(strSize, batchSize)
-	return &proto.ColArr[string]{Data: &col}
+	return &proto.ColArr[string]{
+		Offsets: make(proto.ColUInt64, 0, batchSize),
+		Data:    &col,
+	}
+}
+
+func newColBytes(strSize, batchSize int) proto.ColBytes {
+	return proto.ColBytes{
+		ColStr: newColString(strSize, batchSize),
+	}
+}
+
+func newColArrayBytes(strSize, batchSize int) *proto.ColArr[[]byte] {
+	col := newColBytes(strSize, batchSize)
+	return &proto.ColArr[[]byte]{
+		Offsets: make(proto.ColUInt64, 0, batchSize),
+		Data:    &col,
+	}
 }
 
 func newColJSONBytes(jsonSize, batchSize int) proto.ColJSONBytes {
@@ -45,7 +65,10 @@ func newColJSONBytes(jsonSize, batchSize int) proto.ColJSONBytes {
 
 func newColArrayJSONBytes(jsonSize, batchSize int) *proto.ColArr[[]byte] {
 	col := newColJSONBytes(jsonSize, batchSize)
-	return &proto.ColArr[[]byte]{Data: &col}
+	return &proto.ColArr[[]byte]{
+		Offsets: make(proto.ColUInt64, 0, batchSize),
+		Data:    &col,
+	}
 }
 
 func newColDateTime64Raw(batchSize int) proto.ColDateTime64Raw {
@@ -61,5 +84,8 @@ func newColDateTime64Raw(batchSize int) proto.ColDateTime64Raw {
 
 func newColArrayDateTime64Raw(batchSize int) *proto.ColArr[proto.DateTime64] {
 	col := newColDateTime64Raw(batchSize)
-	return &proto.ColArr[proto.DateTime64]{Data: &col}
+	return &proto.ColArr[proto.DateTime64]{
+		Offsets: make(proto.ColUInt64, 0, batchSize),
+		Data:    &col,
+	}
 }

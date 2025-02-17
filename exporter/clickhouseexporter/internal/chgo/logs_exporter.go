@@ -6,7 +6,6 @@ import (
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/proto"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/zap"
@@ -27,12 +26,14 @@ type LogsExporter struct {
 	resourceAttributesJSONBuffer *JSONBuffer
 	scopeAttributesJSONBuffer    *JSONBuffer
 	logAttributesJSONBuffer      *JSONBuffer
+
+	hexEncodeBuffer []byte
 }
 
 type logColumns struct {
 	timestamp          proto.ColDateTime64Raw
-	traceID            proto.ColStr
-	spanID             proto.ColStr
+	traceID            proto.ColBytes
+	spanID             proto.ColBytes
 	traceFlags         proto.ColUInt8
 	severityText       *proto.ColLowCardinality[string]
 	severityNumber     proto.ColUInt8
@@ -69,8 +70,8 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 
 	cols := &logColumns{
 		timestamp:          newColDateTime64Raw(bSize),
-		traceID:            newColString(strSize, bSize),
-		spanID:             newColString(strSize, bSize),
+		traceID:            newColBytes(strSize, bSize),
+		spanID:             newColBytes(strSize, bSize),
 		traceFlags:         make(proto.ColUInt8, 0, bSize),
 		severityText:       newColLowCardinalityString(strSize, bSize),
 		severityNumber:     make(proto.ColUInt8, 0, bSize),
@@ -107,6 +108,8 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 	e.resourceAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
 	e.scopeAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
 	e.logAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
+
+	e.hexEncodeBuffer = make([]byte, 0, 128)
 
 	return nil
 }
@@ -164,8 +167,10 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 				cols.timestamp.Append(proto.DateTime64(timestamp))
 				cols.scopeName.Append(scopeName)
 				cols.body.Append(r.Body().Str())
-				cols.traceID.Append(traceutil.TraceIDToHexOrEmptyString(r.TraceID()))
-				cols.spanID.Append(traceutil.SpanIDToHexOrEmptyString(r.SpanID()))
+				e.hexEncodeBuffer = appendTraceIDToHex(e.hexEncodeBuffer[:0], r.TraceID())
+				cols.traceID.Append(e.hexEncodeBuffer)
+				e.hexEncodeBuffer = appendSpanIDToHex(e.hexEncodeBuffer[:0], r.SpanID())
+				cols.spanID.Append(e.hexEncodeBuffer)
 				cols.traceFlags.Append(uint8(r.Flags()))
 				cols.severityNumber.Append(uint8(r.SeverityNumber()))
 				cols.serviceName.Append(serviceName)

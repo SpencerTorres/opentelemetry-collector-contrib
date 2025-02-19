@@ -9,13 +9,15 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/zap"
+	"sync"
 	"time"
 )
 
-type LogsExporter struct {
+type logsExporter struct {
 	cfg    *ChConfig
 	logger *zap.Logger
 
+	mu sync.Mutex
 	db *ch.Client
 
 	maxBatchSize int
@@ -48,8 +50,8 @@ type logColumns struct {
 	logAttributes      proto.ColJSONBytes
 }
 
-func NewLogsExporter(cfg *ChConfig, logger *zap.Logger) (*LogsExporter, error) {
-	return &LogsExporter{
+func newLogsExporter(cfg *ChConfig, logger *zap.Logger) (*logsExporter, error) {
+	return &logsExporter{
 		cfg:          cfg,
 		logger:       logger.Named("clickhouse"),
 		maxBatchSize: 8192,
@@ -57,7 +59,10 @@ func NewLogsExporter(cfg *ChConfig, logger *zap.Logger) (*LogsExporter, error) {
 	}, nil
 }
 
-func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
+func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	err := connectDB(ctx, &e.db, e.cfg)
 	if err != nil {
 		_ = closeDB(&e.db)
@@ -114,11 +119,16 @@ func (e *LogsExporter) Start(ctx context.Context, _ component.Host) error {
 	return nil
 }
 
-func (e *LogsExporter) Shutdown(_ context.Context) error {
+func (e *logsExporter) shutdown(_ context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	return closeDB(&e.db)
 }
 
-func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
+func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	if e.db == nil {
 		if err := connectDB(ctx, &e.db, e.cfg); err != nil {
 			return err
@@ -201,4 +211,72 @@ func (e *LogsExporter) PushLogsData(ctx context.Context, ld plog.Logs) error {
 		zap.String("cost", duration.String()))
 
 	return nil
+}
+
+type LogsExporterPool struct {
+	pool chan *logsExporter
+}
+
+func NewLogsExporterPool(cfg *ChConfig, logger *zap.Logger, poolSize int) (*LogsExporterPool, error) {
+	pool := LogsExporterPool{
+		pool: make(chan *logsExporter, poolSize),
+	}
+
+	for i := 0; i < poolSize; i++ {
+		instance, err := newLogsExporter(cfg, logger)
+		if err != nil {
+			return nil, err
+		}
+
+		pool.pool <- instance
+	}
+
+	return &pool, nil
+}
+
+func (p *LogsExporterPool) acquire() *logsExporter {
+	return <-p.pool
+}
+
+func (p *LogsExporterPool) release(e *logsExporter) {
+	p.pool <- e
+}
+
+func (p *LogsExporterPool) Start(ctx context.Context, host component.Host) error {
+	for i := 0; i < cap(p.pool); i++ {
+		exporter := p.acquire()
+
+		err := exporter.start(ctx, host)
+		if err != nil {
+			p.release(exporter)
+			return err
+		}
+
+		p.release(exporter)
+	}
+
+	return nil
+}
+
+func (p *LogsExporterPool) Shutdown(ctx context.Context) error {
+	for i := 0; i < cap(p.pool); i++ {
+		exporter := p.acquire()
+
+		err := exporter.shutdown(ctx)
+		if err != nil {
+			p.release(exporter)
+			return err
+		}
+
+		p.release(exporter)
+	}
+
+	return nil
+}
+
+func (p *LogsExporterPool) PushLogsData(ctx context.Context, ld plog.Logs) error {
+	exporter := p.acquire()
+	defer p.release(exporter)
+
+	return exporter.pushLogsData(ctx, ld)
 }

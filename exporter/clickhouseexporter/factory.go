@@ -120,7 +120,7 @@ func createLogsExporter(
 		return nil, fmt.Errorf("cannot create clickhouse logs exporter config: %w", err)
 	}
 
-	exporter, err := chgo.NewLogsExporter(chCfg, set.Logger)
+	logsEx, err := chgo.NewLogsExporterPool(chCfg, set.Logger, c.QueueSettings.NumConsumers)
 	if err != nil {
 		return nil, fmt.Errorf("cannot configure clickhouse logs exporter: %w", err)
 	}
@@ -129,9 +129,9 @@ func createLogsExporter(
 		ctx,
 		set,
 		cfg,
-		exporter.PushLogsData,
-		exporterhelper.WithStart(exporter.Start),
-		exporterhelper.WithShutdown(exporter.Shutdown),
+		logsEx.PushLogsData,
+		exporterhelper.WithStart(logsEx.Start),
+		exporterhelper.WithShutdown(logsEx.Shutdown),
 		exporterhelper.WithTimeout(c.TimeoutSettings),
 		exporterhelper.WithQueue(c.QueueSettings),
 		exporterhelper.WithRetry(c.BackOffConfig),

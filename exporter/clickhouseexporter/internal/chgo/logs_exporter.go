@@ -254,19 +254,21 @@ func (p *LogsExporterPool) Start(ctx context.Context, host component.Host) error
 }
 
 func (p *LogsExporterPool) Shutdown(ctx context.Context) error {
+	var err error
 	for i := 0; i < cap(p.pool); i++ {
 		exporter := p.acquire()
 
-		err := exporter.shutdown(ctx)
-		if err != nil {
-			p.release(exporter)
-			return err
+		shutdownErr := exporter.shutdown(ctx)
+		if shutdownErr != nil && err == nil {
+			err = shutdownErr
 		}
-
-		p.release(exporter)
 	}
 
 	close(p.pool)
+
+	if err != nil {
+		return err
+	}
 
 	return nil
 }

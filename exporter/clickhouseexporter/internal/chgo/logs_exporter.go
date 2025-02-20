@@ -9,7 +9,6 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/zap"
-	"sync"
 	"time"
 )
 
@@ -17,7 +16,6 @@ type logsExporter struct {
 	cfg    *ChConfig
 	logger *zap.Logger
 
-	mu sync.Mutex
 	db *ch.Client
 
 	maxBatchSize int
@@ -60,9 +58,6 @@ func newLogsExporter(cfg *ChConfig, logger *zap.Logger) (*logsExporter, error) {
 }
 
 func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	err := connectDB(ctx, &e.db, e.cfg)
 	if err != nil {
 		_ = closeDB(&e.db)
@@ -120,15 +115,10 @@ func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
 }
 
 func (e *logsExporter) shutdown(_ context.Context) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	return closeDB(&e.db)
 }
 
 func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	if e.db == nil {
 		if err := connectDB(ctx, &e.db, e.cfg); err != nil {
 			return err
@@ -275,6 +265,8 @@ func (p *LogsExporterPool) Shutdown(ctx context.Context) error {
 
 		p.release(exporter)
 	}
+
+	close(p.pool)
 
 	return nil
 }

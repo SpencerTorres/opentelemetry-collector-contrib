@@ -54,7 +54,7 @@ func newLogsExporter(cfg *ChConfig, logger *zap.Logger) (*logsExporter, error) {
 	return &logsExporter{
 		cfg:          cfg,
 		logger:       logger.Named("clickhouse"),
-		maxBatchSize: 8192,
+		maxBatchSize: 10 * 1024,
 		insertSQL:    fmt.Sprintf(`INSERT INTO "%s"."%s" VALUES`, cfg.Database, cfg.Table),
 	}, nil
 }
@@ -69,8 +69,8 @@ func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
 		e.logger.Error(fmt.Sprintf("initial connection failed: %s", err))
 	}
 
-	jsonSize := 512
-	strSize := 64
+	jsonSize := 1024
+	strSize := 128
 	bSize := e.maxBatchSize
 
 	cols := &logColumns{
@@ -114,7 +114,7 @@ func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
 	e.scopeAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
 	e.logAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
 
-	e.hexEncodeBuffer = make([]byte, 0, 128)
+	e.hexEncodeBuffer = make([]byte, 0, 256)
 
 	return nil
 }
@@ -138,7 +138,7 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 	cols := e.columns
 	e.insertInput.Reset()
 
-	start := time.Now()
+	processStart := time.Now()
 
 	var logCount int
 	rsLogs := ld.ResourceLogs()
@@ -197,6 +197,8 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 		}
 	}
 
+	processDuration := time.Since(processStart)
+	networkStart := time.Now()
 	if err := e.db.Do(ctx, ch.Query{
 		Body:  e.insertSQL,
 		Input: e.insertInput,
@@ -206,9 +208,12 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 		return fmt.Errorf("chgo logs insert: %w", err)
 	}
 
-	duration := time.Since(start)
+	networkDuration := time.Since(networkStart)
+	totalDuration := time.Since(processStart)
 	e.logger.Debug("insert logs", zap.Int("records", logCount),
-		zap.String("cost", duration.String()))
+		zap.String("process_cost", processDuration.String()),
+		zap.String("network_cost", networkDuration.String()),
+		zap.String("total_cost", totalDuration.String()))
 
 	return nil
 }

@@ -60,7 +60,7 @@ func createLogsExporter(
 	cfg component.Config,
 ) (exporter.Logs, error) {
 	c := cfg.(*Config)
-	exporter, err := newLogsExporter(set.Logger, c)
+	exporter, err := newLogsExporter(set.Logger, c, c.QueueSettings.NumConsumers)
 	if err != nil {
 		return nil, fmt.Errorf("cannot configure clickhouse logs exporter: %w", err)
 	}

@@ -7,6 +7,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/json"
 	"time"
 
 	_ "github.com/ClickHouse/clickhouse-go/v2" // For register database driver.
@@ -15,28 +17,51 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/internal/coreinternal/traceutil"
 )
 
 type logsExporter struct {
-	client    *sql.DB
+	db        driver.Conn
 	insertSQL string
 
 	logger *zap.Logger
 	cfg    *Config
+
+	resourceAttributesBufferPool *internal.ExporterStructPool[*json.JSONBuffer]
+	scopeAttributesBufferPool    *internal.ExporterStructPool[*json.JSONBuffer]
+	logAttributesBufferPool      *internal.ExporterStructPool[*json.JSONBuffer]
+	traceHexBufferPool           *internal.ExporterStructPool[[]byte]
+	spanHexBufferPool            *internal.ExporterStructPool[[]byte]
 }
 
-func newLogsExporter(logger *zap.Logger, cfg *Config) (*logsExporter, error) {
-	client, err := newClickhouseClient(cfg)
+func newLogsExporter(logger *zap.Logger, cfg *Config, numConsumers int) (*logsExporter, error) {
+	db, err := newClickhouseNativeClient(cfg)
 	if err != nil {
 		return nil, err
 	}
 
+	newJSONBuffer := func() (*json.JSONBuffer, error) {
+		return json.NewJSONBuffer(2048, 256), nil
+	}
+	newHexBuffer := func() ([]byte, error) {
+		return make([]byte, 0, 128), nil
+	}
+
+	resourceAttributesBufferPool, _ := internal.NewExporterStructPool[*json.JSONBuffer](numConsumers, newJSONBuffer)
+	scopeAttributesBufferPool, _ := internal.NewExporterStructPool[*json.JSONBuffer](numConsumers, newJSONBuffer)
+	logAttributesBufferPool, _ := internal.NewExporterStructPool[*json.JSONBuffer](numConsumers, newJSONBuffer)
+	traceHexBufferPool, _ := internal.NewExporterStructPool[[]byte](numConsumers, newHexBuffer)
+	spanHexBufferPool, _ := internal.NewExporterStructPool[[]byte](numConsumers, newHexBuffer)
+
 	return &logsExporter{
-		client:    client,
-		insertSQL: renderInsertLogsSQL(cfg),
-		logger:    logger,
-		cfg:       cfg,
+		db:                           db,
+		insertSQL:                    renderInsertLogsSQL(cfg),
+		logger:                       logger,
+		cfg:                          cfg,
+		resourceAttributesBufferPool: resourceAttributesBufferPool,
+		scopeAttributesBufferPool:    scopeAttributesBufferPool,
+		logAttributesBufferPool:      logAttributesBufferPool,
+		traceHexBufferPool:           traceHexBufferPool,
+		spanHexBufferPool:            spanHexBufferPool,
 	}, nil
 }
 
@@ -49,80 +74,116 @@ func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
 		return err
 	}
 
-	return createLogsTable(ctx, e.cfg, e.client)
+	return createLogsTable(ctx, e.cfg, e.db)
 }
 
 // shutdown will shut down the exporter.
 func (e *logsExporter) shutdown(_ context.Context) error {
-	if e.client != nil {
-		return e.client.Close()
+	if e.db == nil {
+		return nil
 	}
-	return nil
+
+	e.resourceAttributesBufferPool.Destroy()
+	e.scopeAttributesBufferPool.Destroy()
+	e.logAttributesBufferPool.Destroy()
+	e.traceHexBufferPool.Destroy()
+	e.spanHexBufferPool.Destroy()
+
+	return e.db.Close()
 }
 
 func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
-	start := time.Now()
-	err := doWithTx(ctx, e.client, func(tx *sql.Tx) error {
-		statement, err := tx.PrepareContext(ctx, e.insertSQL)
-		if err != nil {
-			return fmt.Errorf("PrepareContext:%w", err)
-		}
-		defer func() {
-			_ = statement.Close()
-		}()
+	batch, err := e.db.PrepareBatch(ctx, e.insertSQL)
+	if err != nil {
+		return err
+	}
 
-		for i := 0; i < ld.ResourceLogs().Len(); i++ {
-			logs := ld.ResourceLogs().At(i)
-			res := logs.Resource()
-			resURL := logs.SchemaUrl()
-			resAttr := internal.AttributesToMap(res.Attributes())
-			serviceName := internal.GetServiceName(res.Attributes())
+	resourceAttributesBuffer := e.resourceAttributesBufferPool.Acquire()
+	defer e.resourceAttributesBufferPool.Release(resourceAttributesBuffer)
+	scopeAttributesBuffer := e.scopeAttributesBufferPool.Acquire()
+	defer e.scopeAttributesBufferPool.Release(scopeAttributesBuffer)
+	logAttributesBuffer := e.logAttributesBufferPool.Acquire()
+	defer e.logAttributesBufferPool.Release(logAttributesBuffer)
+	traceHexBuffer := e.traceHexBufferPool.Acquire()
+	defer e.traceHexBufferPool.Release(traceHexBuffer)
+	spanHexBuffer := e.spanHexBufferPool.Acquire()
+	defer e.spanHexBufferPool.Release(spanHexBuffer)
 
-			for j := 0; j < logs.ScopeLogs().Len(); j++ {
-				rs := logs.ScopeLogs().At(j).LogRecords()
-				scopeURL := logs.ScopeLogs().At(j).SchemaUrl()
-				scopeName := logs.ScopeLogs().At(j).Scope().Name()
-				scopeVersion := logs.ScopeLogs().At(j).Scope().Version()
-				scopeAttr := internal.AttributesToMap(logs.ScopeLogs().At(j).Scope().Attributes())
+	processStart := time.Now()
 
-				for k := 0; k < rs.Len(); k++ {
-					r := rs.At(k)
+	var logCount int
+	rsLogs := ld.ResourceLogs()
+	rsLen := rsLogs.Len()
+	for i := 0; i < rsLen; i++ {
+		logs := rsLogs.At(i)
+		res := logs.Resource()
+		resURL := logs.SchemaUrl()
+		resAttr := res.Attributes()
+		serviceName := internal.GetServiceName(resAttr)
+		resourceAttributesBuffer.Reset()
+		json.AttributesToJSON(resourceAttributesBuffer, resAttr)
 
-					timestamp := r.Timestamp()
-					if timestamp == 0 {
-						timestamp = r.ObservedTimestamp()
-					}
+		slLen := logs.ScopeLogs().Len()
+		for j := 0; j < slLen; j++ {
+			scopeLog := logs.ScopeLogs().At(j)
+			scopeURL := scopeLog.SchemaUrl()
+			scopeLogScope := scopeLog.Scope()
+			scopeName := scopeLogScope.Name()
+			scopeVersion := scopeLogScope.Version()
+			scopeLogRecords := scopeLog.LogRecords()
+			scopeAttributesBuffer.Reset()
+			json.AttributesToJSON(scopeAttributesBuffer, scopeLogScope.Attributes())
 
-					logAttr := internal.AttributesToMap(r.Attributes())
-					_, err = statement.ExecContext(ctx,
-						timestamp.AsTime(),
-						traceutil.TraceIDToHexOrEmptyString(r.TraceID()),
-						traceutil.SpanIDToHexOrEmptyString(r.SpanID()),
-						uint32(r.Flags()),
-						r.SeverityText(),
-						int32(r.SeverityNumber()),
-						serviceName,
-						r.Body().AsString(),
-						resURL,
-						resAttr,
-						scopeURL,
-						scopeName,
-						scopeVersion,
-						scopeAttr,
-						logAttr,
-					)
-					if err != nil {
-						return fmt.Errorf("ExecContext:%w", err)
-					}
+			slrLen := scopeLogRecords.Len()
+			for k := 0; k < slrLen; k++ {
+				r := scopeLogRecords.At(k)
+				logAttributesBuffer.Reset()
+				json.AttributesToJSON(logAttributesBuffer, r.Attributes())
+
+				timestamp := r.Timestamp()
+				if timestamp == 0 {
+					timestamp = r.ObservedTimestamp()
 				}
+
+				traceHexBuffer = json.AppendTraceIDToHex(traceHexBuffer[:0], r.TraceID())
+				spanHexBuffer = json.AppendSpanIDToHex(spanHexBuffer[:0], r.SpanID())
+				batch.Append(
+					timestamp.AsTime(),
+					traceHexBuffer,
+					spanHexBuffer,
+					uint8(r.Flags()),
+					r.SeverityText(),
+					uint8(r.SeverityNumber()),
+					serviceName,
+					r.Body().Str(),
+					resURL,
+					resourceAttributesBuffer.Bytes(),
+					scopeURL,
+					scopeName,
+					scopeVersion,
+					scopeAttributesBuffer.Bytes(),
+					logAttributesBuffer.Bytes(),
+				)
+
+				logCount++
 			}
 		}
-		return nil
-	})
-	duration := time.Since(start)
-	e.logger.Debug("insert logs", zap.Int("records", ld.LogRecordCount()),
-		zap.String("cost", duration.String()))
-	return err
+	}
+
+	processDuration := time.Since(processStart)
+	networkStart := time.Now()
+	if err := batch.Send(); err != nil {
+		return fmt.Errorf("clickhouse logs insert failed: %w", err)
+	}
+
+	networkDuration := time.Since(networkStart)
+	totalDuration := time.Since(processStart)
+	e.logger.Debug("insert logs", zap.Int("records", logCount),
+		zap.String("process_cost", processDuration.String()),
+		zap.String("network_cost", networkDuration.String()),
+		zap.String("total_cost", totalDuration.String()))
+
+	return nil
 }
 
 const (
@@ -208,6 +269,15 @@ func newClickhouseClient(cfg *Config) (*sql.DB, error) {
 	return db, nil
 }
 
+// newClickhouseNativeClient create a clickhouse client using the native interface.
+func newClickhouseNativeClient(cfg *Config) (driver.Conn, error) {
+	db, err := cfg.buildNativeDB()
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
 func createDatabase(ctx context.Context, cfg *Config) error {
 	// use default database to create new database
 	if cfg.Database == defaultDatabase {
@@ -229,8 +299,22 @@ func createDatabase(ctx context.Context, cfg *Config) error {
 	return nil
 }
 
-func createLogsTable(ctx context.Context, cfg *Config, db *sql.DB) error {
-	if _, err := db.ExecContext(ctx, renderCreateLogsTableSQL(cfg)); err != nil {
+func createDatabaseNative(ctx context.Context, cfg *Config, db driver.Conn) error {
+	// use default database to create new database
+	if cfg.Database == defaultDatabase {
+		return nil
+	}
+
+	query := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s %s", cfg.Database, cfg.clusterString())
+	err := db.Exec(ctx, query)
+	if err != nil {
+		return fmt.Errorf("create database: %w", err)
+	}
+	return nil
+}
+
+func createLogsTable(ctx context.Context, cfg *Config, db driver.Conn) error {
+	if err := db.Exec(ctx, renderCreateLogsTableSQL(cfg)); err != nil {
 		return fmt.Errorf("exec create logs table sql: %w", err)
 	}
 	return nil

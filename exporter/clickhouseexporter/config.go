@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"net/url"
 	"time"
 
@@ -172,6 +173,26 @@ func (cfg *Config) buildDB() (*sql.DB, error) {
 	// It also ensures defaults.
 	// See https://github.com/ClickHouse/clickhouse-go/blob/08b27884b899f587eb5c509769cd2bdf74a9e2a1/clickhouse_std.go#L189
 	conn, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	return conn, nil
+}
+
+func (cfg *Config) buildNativeDB() (driver.Conn, error) {
+	dsn, err := cfg.buildDSN()
+	if err != nil {
+		return nil, err
+	}
+
+	opt, err := clickhouse.ParseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	opt.Settings["enable_json_type"] = "1"
+	conn, err := clickhouse.Open(opt)
 	if err != nil {
 		return nil, err
 	}

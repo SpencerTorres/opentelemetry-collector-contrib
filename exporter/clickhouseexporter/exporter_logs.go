@@ -11,7 +11,6 @@ import (
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/json"
 	"time"
 
-	_ "github.com/ClickHouse/clickhouse-go/v2" // For register database driver.
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.uber.org/zap"
@@ -70,7 +69,7 @@ func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
 		return nil
 	}
 
-	if err := createDatabase(ctx, e.cfg); err != nil {
+	if err := createDatabaseNative(ctx, e.cfg, e.db); err != nil {
 		return err
 	}
 

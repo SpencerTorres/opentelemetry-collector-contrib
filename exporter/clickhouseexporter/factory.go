@@ -86,7 +86,7 @@ func createTracesExporter(
 	cfg component.Config,
 ) (exporter.Traces, error) {
 	c := cfg.(*Config)
-	exporter, err := newTracesExporter(set.Logger, c)
+	exporter, err := newTracesExporter(set.Logger, c, c.QueueSettings.NumConsumers)
 	if err != nil {
 		return nil, fmt.Errorf("cannot configure clickhouse traces exporter: %w", err)
 	}

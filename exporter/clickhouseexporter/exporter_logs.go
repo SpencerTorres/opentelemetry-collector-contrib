@@ -30,10 +30,47 @@ type logsExporter struct {
 	logAttributesBufferPool      *internal.ExporterStructPool[*json.JSONBuffer]
 	traceHexBufferPool           *internal.ExporterStructPool[[]byte]
 	spanHexBufferPool            *internal.ExporterStructPool[[]byte]
+
+	batchMetricsClient  driver.Conn
+	batchMetricsVersion string
+	batchMetricsQueue   chan batchMetrics
+}
+
+type batchMetrics struct {
+	timestamp time.Time
+	count     uint64
+	process   uint64
+	network   uint64
+}
+
+func (e *logsExporter) reportBatchMetrics(batchCompleteTime time.Time, batchSize int, processDuration, networkDuration time.Duration) {
+	m := batchMetrics{
+		timestamp: batchCompleteTime,
+		count:     uint64(batchSize),
+		process:   uint64(processDuration.Nanoseconds()),
+		network:   uint64(networkDuration.Nanoseconds()),
+	}
+
+	e.batchMetricsQueue <- m
+}
+
+func (e *logsExporter) listenBatchMetrics() {
+	for m := range e.batchMetricsQueue {
+		ctx := context.Background()
+		err := e.batchMetricsClient.AsyncInsert(ctx, "INSERT INTO otel_chgo.perf VALUES (?, ?, ?, ?, ?)", false, e.batchMetricsVersion, m.timestamp, m.count, m.process, m.network)
+		if err != nil {
+			e.logger.Error("batch metrics reporter failed to export", zap.Error(err))
+		}
+	}
 }
 
 func newLogsExporter(logger *zap.Logger, cfg *Config, numConsumers int) (*logsExporter, error) {
 	db, err := newClickhouseNativeClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	batchMetricsClient, err := newClickhouseNativeClient(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -61,10 +98,16 @@ func newLogsExporter(logger *zap.Logger, cfg *Config, numConsumers int) (*logsEx
 		logAttributesBufferPool:      logAttributesBufferPool,
 		traceHexBufferPool:           traceHexBufferPool,
 		spanHexBufferPool:            spanHexBufferPool,
+
+		batchMetricsVersion: "clickhouse-go-json",
+		batchMetricsClient:  batchMetricsClient,
+		batchMetricsQueue:   make(chan batchMetrics, 1000),
 	}, nil
 }
 
 func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
+	go e.listenBatchMetrics()
+
 	if !e.cfg.shouldCreateSchema() {
 		return nil
 	}
@@ -73,13 +116,21 @@ func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
 		return err
 	}
 
-	return createLogsTable(ctx, e.cfg, e.db)
+	if err := createLogsTable(ctx, e.cfg, e.db); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // shutdown will shut down the exporter.
 func (e *logsExporter) shutdown(_ context.Context) error {
-	if e.db == nil {
-		return nil
+	if e.db != nil {
+		e.db.Close()
+	}
+
+	if e.batchMetricsClient != nil {
+		e.batchMetricsClient.Close()
 	}
 
 	e.resourceAttributesBufferPool.Destroy()
@@ -88,7 +139,9 @@ func (e *logsExporter) shutdown(_ context.Context) error {
 	e.traceHexBufferPool.Destroy()
 	e.spanHexBufferPool.Destroy()
 
-	return e.db.Close()
+	close(e.batchMetricsQueue)
+
+	return nil
 }
 
 func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
@@ -177,9 +230,7 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 
 	networkDuration := time.Since(networkStart)
 	//totalDuration := time.Since(processStart)
-
-	_ = e.db.Exec(ctx, "INSERT INTO otel_chgo.perf VALUES (?, ?, ?, ?, ?)", "clickhouse-go-json", processStart, logCount, processDuration.Nanoseconds(), networkDuration.Nanoseconds())
-
+	e.reportBatchMetrics(processStart, logCount, processDuration, networkDuration)
 	//e.logger.Debug("insert logs", zap.Int("records", logCount),
 	//	zap.String("process_cost", processDuration.String()),
 	//	zap.String("network_cost", networkDuration.String()),

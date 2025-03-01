@@ -23,6 +23,13 @@ type logsExporter struct {
 	insertSQL    string
 	insertInput  proto.Input
 
+	debugInput        proto.Input
+	debugColVersion   proto.ColStr
+	debugColTimestamp proto.ColDateTime64Raw
+	debugColCount     proto.ColUInt64
+	debugColProcess   proto.ColUInt64
+	debugColNetwork   proto.ColUInt64
+
 	resourceAttributesJSONBuffer *JSONBuffer
 	scopeAttributesJSONBuffer    *JSONBuffer
 	logAttributesJSONBuffer      *JSONBuffer
@@ -110,6 +117,20 @@ func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
 	e.logAttributesJSONBuffer = newJSONBuffer(jsonSize, strSize)
 
 	e.hexEncodeBuffer = make([]byte, 0, 256)
+
+	e.debugColVersion = newColString(16, 1)
+	e.debugColTimestamp = newColDateTime64Raw(1)
+	e.debugColCount = make(proto.ColUInt64, 0, 1)
+	e.debugColProcess = make(proto.ColUInt64, 0, 1)
+	e.debugColNetwork = make(proto.ColUInt64, 0, 1)
+
+	e.debugInput = proto.Input{
+		{Name: "Version", Data: &e.debugColVersion},
+		{Name: "Timestamp", Data: &e.debugColTimestamp},
+		{Name: "Count", Data: &e.debugColCount},
+		{Name: "Process", Data: &e.debugColProcess},
+		{Name: "Network", Data: &e.debugColNetwork},
+	}
 
 	return nil
 }
@@ -199,11 +220,25 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 	}
 
 	networkDuration := time.Since(networkStart)
-	totalDuration := time.Since(processStart)
-	e.logger.Debug("insert logs", zap.Int("records", logCount),
-		zap.String("process_cost", processDuration.String()),
-		zap.String("network_cost", networkDuration.String()),
-		zap.String("total_cost", totalDuration.String()))
+	//totalDuration := time.Since(processStart)
+
+	e.debugInput.Reset()
+	e.debugColVersion.Append("ch-go-json")
+	e.debugColTimestamp.Append(proto.DateTime64(processStart.UnixMilli()))
+	e.debugColCount.Append(uint64(logCount))
+	e.debugColProcess.Append(uint64(processDuration.Nanoseconds()))
+	e.debugColNetwork.Append(uint64(networkDuration.Nanoseconds()))
+	if err := e.db.Do(ctx, ch.Query{
+		Body:  "INSERT INTO otel_chgo.perf VALUES",
+		Input: e.debugInput,
+	}); err != nil {
+		_ = closeDB(&e.db)
+		return fmt.Errorf("chgo logs insert: %w", err)
+	}
+	//e.logger.Debug("insert logs", zap.Int("records", logCount),
+	//	zap.String("process_cost", processDuration.String()),
+	//	zap.String("network_cost", networkDuration.String()),
+	//	zap.String("total_cost", totalDuration.String()))
 
 	return nil
 }

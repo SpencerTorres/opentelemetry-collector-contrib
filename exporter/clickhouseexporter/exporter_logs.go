@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"time"
 
 	_ "github.com/ClickHouse/clickhouse-go/v2" // For register database driver.
@@ -24,10 +25,48 @@ type logsExporter struct {
 
 	logger *zap.Logger
 	cfg    *Config
+
+	batchMetricsClient  *sql.DB
+	batchMetricsVersion string
+	batchMetricsQueue   chan batchMetrics
+}
+
+type batchMetrics struct {
+	timestamp time.Time
+	count     uint64
+	process   uint64
+	network   uint64
+}
+
+func (e *logsExporter) reportBatchMetrics(batchCompleteTime time.Time, batchSize int, processDuration, networkDuration time.Duration) {
+	m := batchMetrics{
+		timestamp: batchCompleteTime,
+		count:     uint64(batchSize),
+		process:   uint64(processDuration.Nanoseconds()),
+		network:   uint64(networkDuration.Nanoseconds()),
+	}
+
+	e.batchMetricsQueue <- m
+}
+
+func (e *logsExporter) listenBatchMetrics() {
+	for m := range e.batchMetricsQueue {
+		ctx := context.Background()
+		ctx = clickhouse.Context(ctx, clickhouse.WithStdAsync(false))
+		_, err := e.batchMetricsClient.ExecContext(ctx, "INSERT INTO otel_chgo.perf VALUES (?, ?, ?, ?, ?)", e.batchMetricsVersion, m.timestamp, m.count, m.process, m.network)
+		if err != nil {
+			e.logger.Error("batch metrics reporter failed to export", zap.Error(err))
+		}
+	}
 }
 
 func newLogsExporter(logger *zap.Logger, cfg *Config) (*logsExporter, error) {
 	client, err := newClickhouseClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	batchMetricsClient, err := newClickhouseClient(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -37,10 +76,16 @@ func newLogsExporter(logger *zap.Logger, cfg *Config) (*logsExporter, error) {
 		insertSQL: renderInsertLogsSQL(cfg),
 		logger:    logger,
 		cfg:       cfg,
+
+		batchMetricsVersion: "clickhouse-go-map",
+		batchMetricsClient:  batchMetricsClient,
+		batchMetricsQueue:   make(chan batchMetrics, 1000),
 	}, nil
 }
 
 func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
+	go e.listenBatchMetrics()
+
 	if !e.cfg.shouldCreateSchema() {
 		return nil
 	}
@@ -49,19 +94,35 @@ func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
 		return err
 	}
 
-	return createLogsTable(ctx, e.cfg, e.client)
+	if err := createLogsTable(ctx, e.cfg, e.client); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // shutdown will shut down the exporter.
 func (e *logsExporter) shutdown(_ context.Context) error {
 	if e.client != nil {
-		return e.client.Close()
+		e.client.Close()
 	}
+
+	if e.batchMetricsClient != nil {
+		e.batchMetricsClient.Close()
+	}
+
+	close(e.batchMetricsQueue)
+
 	return nil
 }
 
 func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
-	start := time.Now()
+	var processStart time.Time
+	var networkStart time.Time
+	var processDuration time.Duration
+	var logCount int
+
+	networkStart = time.Now()
 	err := doWithTx(ctx, e.client, func(tx *sql.Tx) error {
 		statement, err := tx.PrepareContext(ctx, e.insertSQL)
 		if err != nil {
@@ -71,6 +132,7 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 			_ = statement.Close()
 		}()
 
+		processStart = time.Now()
 		for i := 0; i < ld.ResourceLogs().Len(); i++ {
 			logs := ld.ResourceLogs().At(i)
 			res := logs.Resource()
@@ -94,6 +156,7 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 					}
 
 					logAttr := internal.AttributesToMap(r.Attributes())
+					logCount++
 					_, err = statement.ExecContext(ctx,
 						timestamp.AsTime(),
 						traceutil.TraceIDToHexOrEmptyString(r.TraceID()),
@@ -116,12 +179,16 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 					}
 				}
 			}
+			processDuration = time.Since(processStart)
 		}
 		return nil
 	})
-	duration := time.Since(start)
-	e.logger.Debug("insert logs", zap.Int("records", ld.LogRecordCount()),
-		zap.String("cost", duration.String()))
+
+	networkDuration := time.Since(networkStart) - processDuration
+	e.reportBatchMetrics(networkStart, logCount, processDuration, networkDuration)
+	//duration := time.Since(start)
+	//e.logger.Debug("insert logs", zap.Int("records", ld.LogRecordCount()),
+	//	zap.String("cost", duration.String()))
 	return err
 }
 

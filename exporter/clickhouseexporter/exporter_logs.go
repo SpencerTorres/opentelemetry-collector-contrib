@@ -176,11 +176,14 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 	}
 
 	networkDuration := time.Since(networkStart)
-	totalDuration := time.Since(processStart)
-	e.logger.Debug("insert logs", zap.Int("records", logCount),
-		zap.String("process_cost", processDuration.String()),
-		zap.String("network_cost", networkDuration.String()),
-		zap.String("total_cost", totalDuration.String()))
+	//totalDuration := time.Since(processStart)
+
+	_ = e.db.Exec(ctx, "INSERT INTO otel_chgo.perf VALUES (?, ?, ?, ?, ?)", "clickhouse-go-json", processStart, logCount, processDuration.Nanoseconds(), networkDuration.Nanoseconds())
+
+	//e.logger.Debug("insert logs", zap.Int("records", logCount),
+	//	zap.String("process_cost", processDuration.String()),
+	//	zap.String("network_cost", networkDuration.String()),
+	//	zap.String("total_cost", totalDuration.String()))
 
 	return nil
 }

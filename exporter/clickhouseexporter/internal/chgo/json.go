@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"strconv"
+	"strings"
 )
 
 // appendSpanIDToHex writes a hex encoded byte slice of SpanID.
@@ -170,5 +171,12 @@ func (b *JSONBuffer) WriteByte(c byte) {
 // WriteQuote writes a quoted string to the buffer
 func (b *JSONBuffer) WriteQuote(s string) {
 	b.grow(len(s) + 2)
-	b.buf = strconv.AppendQuote(b.buf, s)
+
+	if strings.ContainsAny(s, `"\:`) {
+		b.buf = strconv.AppendQuote(b.buf, s)
+	} else {
+		b.buf = append(b.buf, '"')
+		b.buf = append(b.buf, s...)
+		b.buf = append(b.buf, '"')
+	}
 }

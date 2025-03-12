@@ -9,35 +9,30 @@ CREATE TABLE IF NOT EXISTS otel_traces (
     SpanName LowCardinality(String) CODEC(ZSTD(1)),
     SpanKind LowCardinality(String) CODEC(ZSTD(1)),
     ServiceName LowCardinality(String) CODEC(ZSTD(1)),
-    ResourceAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    ResourceAttributes JSON,
     ScopeName String CODEC(ZSTD(1)),
     ScopeVersion String CODEC(ZSTD(1)),
-    SpanAttributes Map(LowCardinality(String), String) CODEC(ZSTD(1)),
+    SpanAttributes JSON,
     Duration UInt64 CODEC(ZSTD(1)),
     StatusCode LowCardinality(String) CODEC(ZSTD(1)),
     StatusMessage String CODEC(ZSTD(1)),
     Events Nested (
         Timestamp DateTime64(9),
         Name LowCardinality(String),
-        Attributes Map(LowCardinality(String), String)
+        Attributes JSON
     ) CODEC(ZSTD(1)),
     Links Nested (
         TraceId String,
         SpanId String,
         TraceState String,
-        Attributes Map(LowCardinality(String), String)
+        Attributes JSON
     ) CODEC(ZSTD(1)),
-    INDEX idx_trace_id TraceId TYPE bloom_filter(0.001) GRANULARITY 1,
-    INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_span_attr_key mapKeys(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_span_attr_value mapValues(SpanAttributes) TYPE bloom_filter(0.01) GRANULARITY 1,
-    INDEX idx_duration Duration TYPE minmax GRANULARITY 1
-) ENGINE = MergeTree()
-PARTITION BY toDate(Timestamp)
-ORDER BY (ServiceName, SpanName, toDateTime(Timestamp))
-TTL toDate(Timestamp) + toIntervalDay(180)
-SETTINGS index_granularity=8192, ttl_only_drop_parts = 1;
+    ) ENGINE = MergeTree()
+    PARTITION BY toMonth(Timestamp)
+    PRIMARY KEY (ServiceName, SpanName, toDateTime(Timestamp))
+    ORDER BY (ServiceName, SpanName, toDateTime(Timestamp), Timestamp)
+    SETTINGS index_granularity=8192, ttl_only_drop_parts = 1;
+
 
 
 CREATE TABLE IF NOT EXISTS otel_traces_trace_id_ts (

@@ -204,7 +204,9 @@ func (e *logsExporter) pushLogsData(ctx context.Context, ld plog.Logs) error {
 
 	networkDuration := time.Since(networkStart)
 	//totalDuration := time.Since(processStart)
-	e.reportBatchMetrics(processStart, logCount, processDuration, networkDuration)
+	if e.cfg.BatchMetricsEnabled {
+		e.reportBatchMetrics(processStart, logCount, processDuration, networkDuration)
+	}
 	//e.logger.Debug("insert logs", zap.Int("records", logCount),
 	//	zap.String("process_cost", processDuration.String()),
 	//	zap.String("network_cost", networkDuration.String()),
@@ -221,12 +223,16 @@ func (e *logsExporter) reportBatchMetrics(batchCompleteTime time.Time, batchSize
 		network:   uint64(networkDuration.Nanoseconds()),
 	}
 
-	e.batchMetricsQueue <- m
+	select {
+	case e.batchMetricsQueue <- m:
+	default:
+	}
 }
 
 type LogsExporterPool struct {
 	pool chan *logsExporter
 
+	debugInsertSQL    string
 	debugInput        proto.Input
 	debugColVersion   proto.ColStr
 	debugColTimestamp proto.ColDateTime64Raw
@@ -235,6 +241,7 @@ type LogsExporterPool struct {
 	debugColNetwork   proto.ColUInt64
 
 	cfg                 *ChConfig
+	logger              *zap.Logger
 	batchMetricsClient  *ch.Client
 	batchMetricsVersion string
 	batchMetricsQueue   chan batchMetrics
@@ -253,34 +260,36 @@ func (p *LogsExporterPool) listenBatchMetrics() {
 
 		if p.batchMetricsClient == nil {
 			if err := connectDB(ctx, &p.batchMetricsClient, p.cfg); err != nil {
-				fmt.Println("batch metrics connect err", err)
+				p.logger.Error("batch metrics connect err", zap.Error(err))
 				continue
 			}
 		}
 
 		p.debugInput.Reset()
-		p.debugColVersion.Append("ch-go-json")
+		p.debugColVersion.Append(p.batchMetricsVersion)
 		p.debugColTimestamp.Append(proto.DateTime64(m.timestamp.UnixMilli()))
 		p.debugColCount.Append(m.count)
 		p.debugColProcess.Append(m.process)
 		p.debugColNetwork.Append(m.network)
 		if err := p.batchMetricsClient.Do(ctx, ch.Query{
-			Body:     "INSERT INTO otel_chgo.perf VALUES",
+			Body:     p.debugInsertSQL,
 			Input:    p.debugInput,
 			Settings: []ch.Setting{{Key: "async_insert", Value: "1"}, {Key: "wait_for_async_insert", Value: "0"}},
 		}); err != nil {
 			_ = closeDB(&p.batchMetricsClient)
-			fmt.Println("batch metrics insert err", err)
+			p.logger.Error("batch metrics insert err", zap.Error(err))
 		}
 	}
 }
 
 func NewLogsExporterPool(cfg *ChConfig, logger *zap.Logger, poolSize int) (*LogsExporterPool, error) {
 	pool := LogsExporterPool{
-		pool: make(chan *logsExporter, poolSize),
-		cfg:  cfg,
+		pool:   make(chan *logsExporter, poolSize),
+		cfg:    cfg,
+		logger: logger,
 
-		batchMetricsVersion: "ch-go-json",
+		debugInsertSQL:      fmt.Sprintf(`INSERT INTO "%s"."%s" VALUES`, cfg.Database, cfg.BatchMetricsTableName),
+		batchMetricsVersion: fmt.Sprintf("logs_%s", cfg.BatchMetricsConfigName),
 		batchMetricsQueue:   make(chan batchMetrics, 1000),
 	}
 
@@ -317,25 +326,27 @@ func (p *LogsExporterPool) Start(ctx context.Context, host component.Host) error
 		p.release(exporter)
 	}
 
-	if err := connectDB(ctx, &p.batchMetricsClient, p.cfg); err != nil {
-		return err
+	if p.cfg.BatchMetricsEnabled {
+		if err := connectDB(ctx, &p.batchMetricsClient, p.cfg); err != nil {
+			return err
+		}
+
+		p.debugColVersion = newColString(16, 1)
+		p.debugColTimestamp = newColDateTime64Raw(1)
+		p.debugColCount = make(proto.ColUInt64, 0, 1)
+		p.debugColProcess = make(proto.ColUInt64, 0, 1)
+		p.debugColNetwork = make(proto.ColUInt64, 0, 1)
+
+		p.debugInput = proto.Input{
+			{Name: "Version", Data: &p.debugColVersion},
+			{Name: "Timestamp", Data: &p.debugColTimestamp},
+			{Name: "Count", Data: &p.debugColCount},
+			{Name: "Process", Data: &p.debugColProcess},
+			{Name: "Network", Data: &p.debugColNetwork},
+		}
+
+		go p.listenBatchMetrics()
 	}
-
-	p.debugColVersion = newColString(16, 1)
-	p.debugColTimestamp = newColDateTime64Raw(1)
-	p.debugColCount = make(proto.ColUInt64, 0, 1)
-	p.debugColProcess = make(proto.ColUInt64, 0, 1)
-	p.debugColNetwork = make(proto.ColUInt64, 0, 1)
-
-	p.debugInput = proto.Input{
-		{Name: "Version", Data: &p.debugColVersion},
-		{Name: "Timestamp", Data: &p.debugColTimestamp},
-		{Name: "Count", Data: &p.debugColCount},
-		{Name: "Process", Data: &p.debugColProcess},
-		{Name: "Network", Data: &p.debugColNetwork},
-	}
-
-	go p.listenBatchMetrics()
 
 	return nil
 }
@@ -353,10 +364,12 @@ func (p *LogsExporterPool) Shutdown(ctx context.Context) error {
 
 	close(p.pool)
 
-	if p.batchMetricsClient != nil {
-		p.batchMetricsClient.Close()
+	if p.cfg.BatchMetricsEnabled {
+		if p.batchMetricsClient != nil {
+			p.batchMetricsClient.Close()
+		}
+		close(p.batchMetricsQueue)
 	}
-	close(p.batchMetricsQueue)
 
 	if err != nil {
 		return err

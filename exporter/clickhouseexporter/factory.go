@@ -63,21 +63,39 @@ func chConfigFromComponentConfig(cfg *Config, traces bool) (*chgo.ChConfig, erro
 
 	queryParams := dsnURL.Query()
 
+	// Add connection params to query params.
+	for k, v := range cfg.ConnectionParams {
+		queryParams.Set(k, v)
+	}
+
 	secureStr := queryParams.Get("secure")
+	queryParams.Del("secure")
 	secure, err := strconv.ParseBool(secureStr)
 	if secureStr != "" && err != nil {
 		return nil, fmt.Errorf("fail parse secure param: %w", err)
 	}
-	queryParams.Del("secure")
 
 	compression := queryParams.Get("compress")
 	queryParams.Del("compress")
 	compressionLevelStr := queryParams.Get("compress_level")
+	queryParams.Del("compress_level")
 	compressionLevel, err := strconv.Atoi(compressionLevelStr)
 	if compressionLevelStr != "" && err != nil {
 		return nil, fmt.Errorf("fail parse compress_level param: %w", err)
 	}
-	queryParams.Del("compress_level")
+
+	dialTimeoutStr := queryParams.Get("dial_timeout")
+	queryParams.Del("dial_timeout")
+	dialTimeout, err := time.ParseDuration(dialTimeoutStr)
+	if dialTimeoutStr != "" && err != nil {
+		return nil, fmt.Errorf("fail parse dial_timeout param: %w", err)
+	}
+
+	batchMetricsTableName := queryParams.Get("batch_metrics_table_name")
+	queryParams.Del("batch_metrics_table_name")
+	batchMetricsConfigName := queryParams.Get("batch_metrics_config_name")
+	queryParams.Del("batch_metrics_config_name")
+	batchMetricsEnabled := batchMetricsTableName != "" && batchMetricsConfigName != ""
 
 	settings := make(map[string]string, len(queryParams))
 	for key := range queryParams {
@@ -99,8 +117,13 @@ func chConfigFromComponentConfig(cfg *Config, traces bool) (*chgo.ChConfig, erro
 		Compression:      compression,
 		CompressionLevel: compressionLevel,
 		TLS:              secure,
+		DialTimeout:      dialTimeout,
 		ClientName:       "otel-chgo",
 		Settings:         settings,
+
+		BatchMetricsEnabled:    batchMetricsEnabled,
+		BatchMetricsTableName:  batchMetricsTableName,
+		BatchMetricsConfigName: batchMetricsConfigName,
 	}
 
 	return &chCfg, nil

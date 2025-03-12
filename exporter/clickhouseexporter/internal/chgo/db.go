@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/ClickHouse/ch-go"
 	"github.com/ClickHouse/ch-go/compress"
+	"time"
 )
 
 type ChConfig struct {
@@ -17,8 +18,13 @@ type ChConfig struct {
 	Compression      string
 	CompressionLevel int
 	TLS              bool
+	DialTimeout      time.Duration
 	ClientName       string
 	Settings         map[string]string
+
+	BatchMetricsEnabled    bool
+	BatchMetricsTableName  string
+	BatchMetricsConfigName string
 }
 
 func connectDB(ctx context.Context, db **ch.Client, cfg *ChConfig) error {
@@ -36,6 +42,7 @@ func connectDB(ctx context.Context, db **ch.Client, cfg *ChConfig) error {
 		Database:         cfg.Database,
 		Compression:      ch.Compression(compressMethod),
 		CompressionLevel: ch.CompressionLevel(cfg.CompressionLevel),
+		DialTimeout:      cfg.DialTimeout,
 		ClientName:       cfg.ClientName,
 		TLS:              tlsCfg,
 		Settings:         make([]ch.Setting, 1, 1+len(cfg.Settings)),

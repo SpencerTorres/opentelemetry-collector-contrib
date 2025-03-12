@@ -8,10 +8,11 @@ package clickhouseexporter // import "github.com/open-telemetry/opentelemetry-co
 import (
 	"context"
 	"fmt"
-	chgo "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/chgo"
 	"net/url"
 	"strconv"
 	"time"
+
+	chgo "github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/chgo"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/configretry"
@@ -35,6 +36,8 @@ func NewFactory() exporter.Factory {
 
 func createDefaultConfig() component.Config {
 	return &Config{
+		collectorVersion: "unknown",
+
 		TimeoutSettings:  exporterhelper.NewDefaultTimeoutConfig(),
 		QueueSettings:    exporterhelper.NewDefaultQueueConfig(),
 		BackOffConfig:    configretry.NewDefaultBackOffConfig(),
@@ -137,6 +140,7 @@ func createLogsExporter(
 	cfg component.Config,
 ) (exporter.Logs, error) {
 	c := cfg.(*Config)
+	c.collectorVersion = set.BuildInfo.Version
 
 	chCfg, err := chConfigFromComponentConfig(c, false)
 	if err != nil {
@@ -186,6 +190,7 @@ func createTracesExporter(
 	cfg component.Config,
 ) (exporter.Traces, error) {
 	c := cfg.(*Config)
+	c.collectorVersion = set.BuildInfo.Version
 
 	chCfg, err := chConfigFromComponentConfig(c, true)
 	if err != nil {
@@ -233,6 +238,7 @@ func createMetricExporter(
 	cfg component.Config,
 ) (exporter.Metrics, error) {
 	c := cfg.(*Config)
+	c.collectorVersion = set.BuildInfo.Version
 	exporter, err := newMetricsExporter(set.Logger, c)
 	if err != nil {
 		return nil, fmt.Errorf("cannot configure clickhouse metrics exporter: %w", err)

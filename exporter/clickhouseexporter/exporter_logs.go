@@ -44,14 +44,14 @@ type batchMetrics struct {
 }
 
 func (e *logsExporter) reportBatchMetrics(batchCompleteTime time.Time, batchSize int, processDuration, networkDuration time.Duration) {
-	m := batchMetrics{
-		timestamp: batchCompleteTime,
-		count:     uint64(batchSize),
-		process:   uint64(processDuration.Nanoseconds()),
-		network:   uint64(networkDuration.Nanoseconds()),
-	}
-
-	e.batchMetricsQueue <- m
+	//m := batchMetrics{
+	//	timestamp: batchCompleteTime,
+	//	count:     uint64(batchSize),
+	//	process:   uint64(processDuration.Nanoseconds()),
+	//	network:   uint64(networkDuration.Nanoseconds()),
+	//}
+	//
+	//e.batchMetricsQueue <- m
 }
 
 func (e *logsExporter) listenBatchMetrics() {
@@ -70,10 +70,10 @@ func newLogsExporter(logger *zap.Logger, cfg *Config, numConsumers int) (*logsEx
 		return nil, err
 	}
 
-	batchMetricsClient, err := newClickhouseNativeClient(cfg)
-	if err != nil {
-		return nil, err
-	}
+	//batchMetricsClient, err := newClickhouseNativeClient(cfg)
+	//if err != nil {
+	//	return nil, err
+	//}
 
 	newJSONBuffer := func() (*json.JSONBuffer, error) {
 		return json.NewJSONBuffer(2048, 256), nil
@@ -100,13 +100,13 @@ func newLogsExporter(logger *zap.Logger, cfg *Config, numConsumers int) (*logsEx
 		spanHexBufferPool:            spanHexBufferPool,
 
 		batchMetricsVersion: "clickhouse-go-json",
-		batchMetricsClient:  batchMetricsClient,
-		batchMetricsQueue:   make(chan batchMetrics, 1000),
+		//batchMetricsClient:  batchMetricsClient,
+		batchMetricsQueue: make(chan batchMetrics, 1000),
 	}, nil
 }
 
 func (e *logsExporter) start(ctx context.Context, _ component.Host) error {
-	go e.listenBatchMetrics()
+	//go e.listenBatchMetrics()
 
 	if !e.cfg.shouldCreateSchema() {
 		return nil

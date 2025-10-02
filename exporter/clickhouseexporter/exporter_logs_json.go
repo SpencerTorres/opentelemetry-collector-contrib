@@ -5,7 +5,6 @@ package clickhouseexporter // import "github.com/open-telemetry/opentelemetry-co
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -91,10 +90,11 @@ func (e *logsJSONExporter) pushLogsData(ctx context.Context, ld plog.Logs) error
 		resAttr := res.Attributes()
 		serviceName := internal.GetServiceName(resAttr)
 		resAttrKeys := internal.UniqueFlattenedAttributes(resAttr)
-		resAttrBytes, resAttrErr := json.Marshal(resAttr.AsRaw())
-		if resAttrErr != nil {
-			return fmt.Errorf("failed to marshal json log resource attributes: %w", resAttrErr)
-		}
+		resAttrJSON := internal.MapToClickHouseJSON(resAttr)
+		//resAttrBytes, resAttrErr := json.Marshal(resAttr.AsRaw())
+		//if resAttrErr != nil {
+		//	return fmt.Errorf("failed to marshal json log resource attributes: %w", resAttrErr)
+		//}
 
 		slLen := logs.ScopeLogs().Len()
 		for j := 0; j < slLen; j++ {
@@ -106,20 +106,22 @@ func (e *logsJSONExporter) pushLogsData(ctx context.Context, ld plog.Logs) error
 			scopeLogRecords := scopeLog.LogRecords()
 			scopeAttr := scopeLogScope.Attributes()
 			scopeAttrKeys := internal.UniqueFlattenedAttributes(scopeAttr)
-			scopeAttrBytes, scopeAttrErr := json.Marshal(scopeAttr.AsRaw())
-			if scopeAttrErr != nil {
-				return fmt.Errorf("failed to marshal json log scope attributes: %w", scopeAttrErr)
-			}
+			scopeAttrJSON := internal.MapToClickHouseJSON(scopeAttr)
+			//scopeAttrBytes, scopeAttrErr := json.Marshal(scopeAttr.AsRaw())
+			//if scopeAttrErr != nil {
+			//	return fmt.Errorf("failed to marshal json log scope attributes: %w", scopeAttrErr)
+			//}
 
 			slrLen := scopeLogRecords.Len()
 			for k := 0; k < slrLen; k++ {
 				r := scopeLogRecords.At(k)
 				logAttr := r.Attributes()
 				logAttrKeys := internal.UniqueFlattenedAttributes(logAttr)
-				logAttrBytes, logAttrErr := json.Marshal(logAttr.AsRaw())
-				if logAttrErr != nil {
-					return fmt.Errorf("failed to marshal json log attributes: %w", logAttrErr)
-				}
+				logAttrJSON := internal.MapToClickHouseJSON(logAttr)
+				//logAttrBytes, logAttrErr := json.Marshal(logAttr.AsRaw())
+				//if logAttrErr != nil {
+				//	return fmt.Errorf("failed to marshal json log attributes: %w", logAttrErr)
+				//}
 
 				timestamp := r.Timestamp()
 				if timestamp == 0 {
@@ -136,14 +138,14 @@ func (e *logsJSONExporter) pushLogsData(ctx context.Context, ld plog.Logs) error
 					serviceName,
 					r.Body().AsString(),
 					resURL,
-					resAttrBytes,
+					resAttrJSON,
 					resAttrKeys,
 					scopeURL,
 					scopeName,
 					scopeVersion,
-					scopeAttrBytes,
+					scopeAttrJSON,
 					scopeAttrKeys,
-					logAttrBytes,
+					logAttrJSON,
 					logAttrKeys,
 				)
 				if appendErr != nil {

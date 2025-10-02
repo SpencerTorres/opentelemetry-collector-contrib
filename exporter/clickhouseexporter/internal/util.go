@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/column"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/column/orderedmap"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -65,4 +66,53 @@ func uniqueFlattenedAttributesNested(pathPrefix string, pathsSet *map[string]str
 
 		return true
 	})
+}
+
+// MapToClickHouseJSON converts a pcommon.Map into a ClickHouse JSON object
+func MapToClickHouseJSON(m pcommon.Map) *clickhouse.JSON {
+	obj := clickhouse.NewJSON()
+
+	mapToClickHouseJSONNested("", obj, m)
+
+	return obj
+}
+
+func mapToClickHouseJSONNested(pathPrefix string, obj *clickhouse.JSON, m pcommon.Map) {
+	m.Range(func(path string, v pcommon.Value) bool {
+		if pathPrefix != "" {
+			var b strings.Builder
+			b.WriteString(pathPrefix)
+			b.WriteRune('.')
+			b.WriteString(path)
+			path = b.String()
+		}
+
+		ValueToJSON(path, obj, v)
+
+		return true
+	})
+}
+
+func ValueToJSON(path string, obj *clickhouse.JSON, v pcommon.Value) {
+	switch v.Type() {
+	case pcommon.ValueTypeEmpty:
+		// TODO: no?
+		obj.SetValueAtPath(path, nil)
+	case pcommon.ValueTypeStr:
+		obj.SetValueAtPath(path, clickhouse.NewDynamicWithType(v.Str(), "String"))
+	case pcommon.ValueTypeBool:
+		obj.SetValueAtPath(path, clickhouse.NewDynamicWithType(v.Bool(), "Bool"))
+	case pcommon.ValueTypeDouble:
+		obj.SetValueAtPath(path, clickhouse.NewDynamicWithType(v.Double(), "Float64"))
+	case pcommon.ValueTypeInt:
+		obj.SetValueAtPath(path, clickhouse.NewDynamicWithType(v.Int(), "Int64"))
+	case pcommon.ValueTypeBytes:
+		// TODO: eh
+	case pcommon.ValueTypeMap:
+		// TODO: handled elsewhere
+		mapToClickHouseJSONNested(path, obj, v.Map())
+	case pcommon.ValueTypeSlice:
+		// TODO: eh
+	default:
+	}
 }

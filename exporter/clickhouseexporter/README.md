@@ -297,6 +297,78 @@ limit 100
 The OTLP Metrics [define two type value for one datapoint](https://github.com/open-telemetry/opentelemetry-proto/blob/main/opentelemetry/proto/metrics/v1/metrics.proto#L358),
 clickhouse only use one value of float64 to store them.
 
+#### Experimental v2 metrics schema (`metrics_schema: v2`)
+
+> [!WARNING]
+> The v2 metrics schema is experimental and may change in backwards-incompatible ways.
+>
+> **The v2 tables require ClickHouse 26.2 or newer; 26.6+ is recommended** (26.6 fixed a
+> granule-pruning bug affecting `IN`-subquery filters in PREWHERE, the core v2 query shape).
+> The series table always uses `text` (full-text-search) indexes and does not fall back to
+> `bloom_filter` on older server versions.
+>
+> The `timeSeries*ToGrid` rate/resample functions used in the reference queries are gated by
+> `allow_experimental_time_series_aggregate_functions = 1` (set per query or per profile).
+>
+> **Clusters:** the v2 engines are currently non-replicated (`MergeTree`/`AggregatingMergeTree`/
+> `ReplacingMergeTree`). Setting `cluster_name` emits `ON CLUSTER` DDL that creates independent,
+> unreplicated tables on every node — not a replicated setup. For self-managed replicated
+> clusters, set `create_schema: false` and create Replicated variants of the DDL by hand.
+> Use the exporter's `sending_queue` batching (see the top of this README) so pushes arrive as
+> large batches; each push issues up to 7 concurrent INSERTs (one per non-empty table).
+
+Setting `metrics_schema: v2` switches metrics to a series/points split schema, similar to how most
+time-series databases store data internally:
+
+- `otel_metrics_series`: one row per series per day, holding the metric identity and all attribute
+  maps (resource/scope/data point), plus per-series metadata such as temporality, monotonicity,
+  histogram bucket bounds, and summary quantile levels. `AggregatingMergeTree` collapses duplicate
+  rows. An in-memory cache (`metrics_v2::series_cache_size`) keeps the exporter from re-writing
+  known series; duplicates from cache misses or multiple collector replicas are harmless.
+- `otel_metrics_points` (gauge + sum), `otel_metrics_histogram_points`,
+  `otel_metrics_exp_histogram_points`, `otel_metrics_summary_points`: data point values keyed by
+  `(MetricName, SeriesHash, TimeUnix)`. Points carry no attribute maps — `SeriesHash` is a 64-bit
+  cityHash64 fingerprint over the metric name and key-sorted attributes (see
+  `internal/metricsv2/hash.go` for the exact serialization).
+- `otel_metrics_exemplars`: exemplars for all metric types.
+- `otel_metrics_families`: metric family metadata (name, type, unit, description).
+- `otel_metrics_points_5m` / `_1h` (+ `_mv` materialized views, `metrics_v2::rollups_enabled`):
+  per-series first/last/min/max/sum/count rollups plus a mergeable `quantileBFloat16` value
+  sketch for long-range queries. First/Last pairs enable reset-aware counter increases across
+  buckets (Thanos-style); the sketch answers any quantile level at query time. Rollups are
+  derived data and can always be rebuilt exactly from the raw points tables.
+- `otel_metrics_histogram_points_5m` / `_1h` (+ `_mv` materialized views, same
+  `metrics_v2::rollups_enabled` flag): explicit-bounds histogram rollups. Scalar Count/Sum get
+  the same First/Last/Sum treatment as the float tier; the per-bucket count arrays get
+  First/Last (`argMin`/`argMax`) states for cumulative per-`le` chaining and a `sumForEach`
+  state for exact delta per-`le` window increases. Exponential histograms are NOT rolled up
+  (per-point Scale/Offset can vary, so element-wise bucket aggregation is unsafe without
+  downscale-merge logic); long-range exp-histogram queries use the raw table.
+
+All attribute maps are written key-sorted, which improves Map column compression and makes the
+fingerprint stable. Timestamps use millisecond precision (`DateTime64(3)`). Point and exemplar
+inserts carry deterministic `insert_deduplication_token`s (the tables set
+`non_replicated_deduplication_window`), so retried pushes after partial failures do not
+double-insert raw rows or double-count rollups. The `table_engine` option does not apply to the
+v2 tables; engines are fixed per table.
+
+Canonical query rules (see `exporter_metrics_v2_math_integration_test.go` for ~20 validated
+reference queries covering the common PromQL shapes):
+
+1. Resolve series first: `SeriesHash IN (SELECT SeriesHash FROM otel_metrics_series WHERE
+   MetricName = ... AND Date BETWEEN toDate(start) AND toDate(end) AND <label matchers>)`.
+   Always bound `Date` — it is the first ORDER BY column of the series table.
+2. Always bound `TimeUnix` on points scans; the `timeSeries*ToGrid` window arguments do NOT
+   prune the scan by themselves.
+3. Join the series table only AFTER aggregating points to per-series rows, and always as
+   `ANY INNER JOIN` — the series table holds one row per series per day (plus unmerged
+   duplicates), so a bare JOIN multiplies results.
+4. Branch on `Temporality`: cumulative sums use `timeSeriesRateToGrid`/`DeltaToGrid`;
+   delta sums are plain `sum()` over the window.
+5. Histogram quantiles: compute bucket increases per series (`argMax`-`argMin` of
+   `BucketCounts` within a series), then sum per `le` across series, then
+   `quantilePrometheusHistogram`.
+
 ### Profiles
 
 > [!IMPORTANT]
@@ -357,6 +429,26 @@ ClickHouse tables:
 - `logs_table_name` (default = otel_logs): The table name for logs.
 - `traces_table_name` (default = otel_traces): The table name for traces.
 - `profiles_table_name` (default = otel_profiles): The table name for profiles.
+- `metrics_schema` (default = `wide`): Selects the metrics table schema. `wide` is the existing
+  one-table-per-type layout with attributes on every row. `v2` (experimental) is the series/points
+  split schema described in the Metrics section above.
+- `metrics_v2`: Options for the experimental v2 metrics schema (only used when `metrics_schema: v2`):
+  - `series_table_name` (default = `otel_metrics_series`)
+  - `points_table_name` (default = `otel_metrics_points`; gauge and sum share this table, and rollup
+    objects derive their names from it)
+  - `histogram_points_table_name` (default = `otel_metrics_histogram_points`; histogram rollup
+    objects derive their names from it)
+  - `exp_histogram_points_table_name` (default = `otel_metrics_exp_histogram_points`)
+  - `summary_points_table_name` (default = `otel_metrics_summary_points`)
+  - `exemplars_table_name` (default = `otel_metrics_exemplars`)
+  - `families_table_name` (default = `otel_metrics_families`)
+  - `rollups_enabled` (default = `true`): create 5m/1h rollup tables and materialized views
+    (float points and explicit-bounds histogram points).
+  - `series_cache_size` (default = `1048576`): max series tracked per day in the in-memory
+    series dedup cache. Up to 8 recently-used day generations are kept (LRU by use, so mixed
+    realtime + backfill timelines stay cached); worst-case memory is 8 × this × ~50 B
+    (~400 MiB at the default). Cache effectiveness (hits/misses/evictions) is logged at
+    debug level about once a minute.
 - `metrics_tables`
     - `gauge`
         - `name` (default = "otel_metrics_gauge")

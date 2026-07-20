@@ -79,6 +79,18 @@ func TestLoadConfig(t *testing.T) {
 					Histogram:            metrics.MetricTypeConfig{Name: "otel_metrics_custom_histogram"},
 					ExponentialHistogram: metrics.MetricTypeConfig{Name: "otel_metrics_custom_exp_histogram"},
 				},
+				MetricsSchema: metricsSchemaWide,
+				MetricsV2: MetricsV2Config{
+					SeriesTableName:             "otel_metrics_series",
+					PointsTableName:             "otel_metrics_points",
+					HistogramPointsTableName:    "otel_metrics_histogram_points",
+					ExpHistogramPointsTableName: "otel_metrics_exp_histogram_points",
+					SummaryPointsTableName:      "otel_metrics_summary_points",
+					ExemplarsTableName:          "otel_metrics_exemplars",
+					FamiliesTableName:           "otel_metrics_families",
+					RollupsEnabled:              true,
+					SeriesCacheSize:             1 << 20,
+				},
 				ConnectionParams: map[string]string{},
 				QueueSettings: configoptional.Some(func() exporterhelper.QueueBatchConfig {
 					queue := exporterhelper.NewDefaultQueueConfig()
@@ -829,4 +841,20 @@ func TestBuildClickHouseOptions_WithCAFileOnly(t *testing.T) {
 
 	// No panic, but options may be nil since TLS setup failed early.
 	require.Nil(t, opt, "expected nil options when TLS setup fails cleanly")
+}
+
+func TestConfig_MetricsSchemaValidation(t *testing.T) {
+	for _, valid := range []string{"", "wide", "v2"} {
+		cfg := withDefaultConfig(func(cfg *Config) {
+			cfg.Endpoint = defaultEndpoint
+			cfg.MetricsSchema = valid
+		})
+		require.NoError(t, cfg.Validate(), "metrics_schema %q must be valid", valid)
+	}
+
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoint = defaultEndpoint
+		cfg.MetricsSchema = "narrow"
+	})
+	require.ErrorIs(t, cfg.Validate(), errConfigInvalidMetricsSchema)
 }

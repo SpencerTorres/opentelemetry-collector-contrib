@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/collector/exporter/exporterhelper"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/xexporterhelper"
 	"go.opentelemetry.io/collector/exporter/xexporter"
+	"go.opentelemetry.io/collector/pdata/pmetric"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter/internal/metadata"
 )
@@ -115,15 +116,25 @@ func createMetricExporter(
 ) (exporter.Metrics, error) {
 	c := cfg.(*Config)
 	c.collectorVersion = set.BuildInfo.Version
-	exp := newMetricsExporter(set.Logger, c)
+
+	var pushMetricsData func(ctx context.Context, md pmetric.Metrics) error
+	var start component.StartFunc
+	var shutdown component.ShutdownFunc
+	if c.metricsV2Enabled() {
+		exp := newMetricsV2Exporter(set.Logger, c)
+		pushMetricsData, start, shutdown = exp.pushMetricsData, exp.start, exp.shutdown
+	} else {
+		exp := newMetricsExporter(set.Logger, c)
+		pushMetricsData, start, shutdown = exp.pushMetricsData, exp.start, exp.shutdown
+	}
 
 	return exporterhelper.NewMetrics(
 		ctx,
 		set,
 		cfg,
-		exp.pushMetricsData,
-		exporterhelper.WithStart(exp.start),
-		exporterhelper.WithShutdown(exp.shutdown),
+		pushMetricsData,
+		exporterhelper.WithStart(start),
+		exporterhelper.WithShutdown(shutdown),
 		exporterhelper.WithTimeout(c.TimeoutSettings),
 		exporterhelper.WithQueue(c.QueueSettings),
 		exporterhelper.WithRetry(c.BackOffConfig),

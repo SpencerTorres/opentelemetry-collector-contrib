@@ -77,6 +77,46 @@ type Config struct {
 	JSON bool `mapstructure:"json"`
 	// MetricsTables defines the table names for metric types.
 	MetricsTables MetricTablesConfig `mapstructure:"metrics_tables"`
+	// MetricsSchema selects the metrics table schema. Valid values:
+	// "wide" (default): one denormalized table per metric type, attributes on every row.
+	// "v2" (experimental): series/points split schema — label sets are stored once
+	// per series per day in a series table and data points reference them via a
+	// 64-bit series fingerprint.
+	MetricsSchema string `mapstructure:"metrics_schema"`
+	// MetricsV2 configures the experimental v2 metrics schema. Only used when
+	// metrics_schema is "v2".
+	MetricsV2 MetricsV2Config `mapstructure:"metrics_v2"`
+}
+
+// MetricsV2Config configures the experimental series/points split metrics schema.
+type MetricsV2Config struct {
+	// SeriesTableName is the table holding one row per series per day. default is `otel_metrics_series`.
+	SeriesTableName string `mapstructure:"series_table_name"`
+	// PointsTableName is the table holding gauge and sum data points. default is `otel_metrics_points`.
+	PointsTableName string `mapstructure:"points_table_name"`
+	// HistogramPointsTableName holds histogram data points. default is `otel_metrics_histogram_points`.
+	HistogramPointsTableName string `mapstructure:"histogram_points_table_name"`
+	// ExpHistogramPointsTableName holds exponential histogram data points. default is `otel_metrics_exp_histogram_points`.
+	ExpHistogramPointsTableName string `mapstructure:"exp_histogram_points_table_name"`
+	// SummaryPointsTableName holds summary data points. default is `otel_metrics_summary_points`.
+	SummaryPointsTableName string `mapstructure:"summary_points_table_name"`
+	// ExemplarsTableName holds exemplars for all metric types. default is `otel_metrics_exemplars`.
+	ExemplarsTableName string `mapstructure:"exemplars_table_name"`
+	// FamiliesTableName holds metric family metadata (name, type, unit, description). default is `otel_metrics_families`.
+	FamiliesTableName string `mapstructure:"families_table_name"`
+	// RollupsEnabled creates 5-minute and 1-hour rollup tables + materialized
+	// views over the points and histogram points tables for long-range
+	// queries. default is true.
+	RollupsEnabled bool `mapstructure:"rollups_enabled"`
+	// RollupTTL is the time-to-live for rollup rows (both tiers), e.g. 2160h.
+	// 0 (default) keeps rollups forever. Raw tables use the top-level `ttl`.
+	RollupTTL time.Duration `mapstructure:"rollup_ttl"`
+	// SeriesCacheSize caps the number of series tracked per day in the
+	// in-memory series cache; up to 8 recently-used day generations are kept
+	// (LRU). Worst-case memory is 8 x this x ~50 bytes (~400 MiB at the
+	// default). A cache miss only causes a duplicate series row, collapsed at
+	// merge time. default is 1048576.
+	SeriesCacheSize int `mapstructure:"series_cache_size"`
 }
 
 type MetricTablesConfig struct {
@@ -107,11 +147,15 @@ const (
 	defaultSummarySuffix      = "_summary"
 	defaultHistogramSuffix    = "_histogram"
 	defaultExpHistogramSuffix = "_exponential_histogram"
+
+	metricsSchemaWide = "wide"
+	metricsSchemaV2   = "v2"
 )
 
 var (
-	errConfigNoEndpoint      = errors.New("endpoint must be specified")
-	errConfigInvalidEndpoint = errors.New("endpoint must be url format")
+	errConfigNoEndpoint           = errors.New("endpoint must be specified")
+	errConfigInvalidEndpoint      = errors.New("endpoint must be url format")
+	errConfigInvalidMetricsSchema = errors.New(`metrics_schema must be one of: "wide", "v2"`)
 )
 
 func createDefaultConfig() component.Config {
@@ -136,6 +180,18 @@ func createDefaultConfig() component.Config {
 			Histogram:            metrics.MetricTypeConfig{Name: defaultMetricTableName + defaultHistogramSuffix},
 			ExponentialHistogram: metrics.MetricTypeConfig{Name: defaultMetricTableName + defaultExpHistogramSuffix},
 		},
+		MetricsSchema: metricsSchemaWide,
+		MetricsV2: MetricsV2Config{
+			SeriesTableName:             defaultMetricTableName + "_series",
+			PointsTableName:             defaultMetricTableName + "_points",
+			HistogramPointsTableName:    defaultMetricTableName + "_histogram_points",
+			ExpHistogramPointsTableName: defaultMetricTableName + "_exp_histogram_points",
+			SummaryPointsTableName:      defaultMetricTableName + "_summary_points",
+			ExemplarsTableName:          defaultMetricTableName + "_exemplars",
+			FamiliesTableName:           defaultMetricTableName + "_families",
+			RollupsEnabled:              true,
+			SeriesCacheSize:             1 << 20,
+		},
 	}
 }
 
@@ -148,6 +204,10 @@ func (cfg *Config) Validate() (err error) {
 	dsn, e := cfg.buildDSN()
 	if e != nil {
 		err = errors.Join(err, e)
+	}
+
+	if cfg.MetricsSchema != "" && cfg.MetricsSchema != metricsSchemaWide && cfg.MetricsSchema != metricsSchemaV2 {
+		err = errors.Join(err, errConfigInvalidMetricsSchema)
 	}
 
 	cfg.buildMetricTableNames()
@@ -239,6 +299,12 @@ func (cfg *Config) buildClickHouseOptions() (*clickhouse.Options, error) {
 // shouldCreateSchema returns true if the exporter should run the DDL for creating database/tables.
 func (cfg *Config) shouldCreateSchema() bool {
 	return cfg.CreateSchema
+}
+
+// metricsV2Enabled returns true when the experimental series/points split
+// metrics schema is selected.
+func (cfg *Config) metricsV2Enabled() bool {
+	return cfg.MetricsSchema == metricsSchemaV2
 }
 
 func (cfg *Config) buildMetricTableNames() {

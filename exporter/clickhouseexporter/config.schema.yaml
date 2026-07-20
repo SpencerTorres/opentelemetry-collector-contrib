@@ -17,6 +17,41 @@ $defs:
       summary:
         description: Summary is the table name for summary metric type. default is `otel_metrics_summary`.
         $ref: ./internal/metrics.metric_type_config
+  metrics_v_2_config:
+    description: MetricsV2Config configures the experimental series/points split metrics schema.
+    type: object
+    properties:
+      exemplars_table_name:
+        description: ExemplarsTableName holds exemplars for all metric types. default is `otel_metrics_exemplars`.
+        type: string
+      exp_histogram_points_table_name:
+        description: ExpHistogramPointsTableName holds exponential histogram data points. default is `otel_metrics_exp_histogram_points`.
+        type: string
+      families_table_name:
+        description: FamiliesTableName holds metric family metadata (name, type, unit, description). default is `otel_metrics_families`.
+        type: string
+      histogram_points_table_name:
+        description: HistogramPointsTableName holds histogram data points. default is `otel_metrics_histogram_points`.
+        type: string
+      points_table_name:
+        description: PointsTableName is the table holding gauge and sum data points. default is `otel_metrics_points`.
+        type: string
+      rollup_ttl:
+        description: RollupTTL is the time-to-live for rollup rows (both tiers), e.g. 2160h. 0 (default) keeps rollups forever. Raw tables use the top-level `ttl`.
+        type: string
+        format: duration
+      rollups_enabled:
+        description: RollupsEnabled creates 5-minute and 1-hour rollup tables + materialized views over the points and histogram points tables for long-range queries. default is true.
+        type: boolean
+      series_cache_size:
+        description: SeriesCacheSize caps the number of series tracked per day in the in-memory series cache; up to 8 recently-used day generations are kept (LRU). Worst-case memory is 8 x this x ~50 bytes (~400 MiB at the default). A cache miss only causes a duplicate series row, collapsed at merge time. default is 1048576.
+        type: integer
+      series_table_name:
+        description: SeriesTableName is the table holding one row per series per day. default is `otel_metrics_series`.
+        type: string
+      summary_points_table_name:
+        description: SummaryPointsTableName holds summary data points. default is `otel_metrics_summary_points`.
+        type: string
   table_engine:
     description: TableEngine defines the ENGINE string value when creating the table.
     type: object
@@ -57,12 +92,18 @@ properties:
   logs_table_name:
     description: LogsTableName is the table name for logs. default is `otel_logs`.
     type: string
+  metrics_schema:
+    description: 'MetricsSchema selects the metrics table schema. Valid values: "wide" (default): one denormalized table per metric type, attributes on every row. "v2" (experimental): series/points split schema — label sets are stored once per series per day in a series table and data points reference them via a 64-bit series fingerprint.'
+    type: string
   metrics_table_name:
     description: 'MetricsTableName is the table name for metrics. default is `otel_metrics`. Deprecated: MetricsTableName exists for historical compatibility and should not be used. To set the metrics tables name, use the MetricsTables parameter instead.'
     type: string
   metrics_tables:
     description: MetricsTables defines the table names for metric types.
     $ref: metric_tables_config
+  metrics_v2:
+    description: MetricsV2 configures the experimental v2 metrics schema. Only used when metrics_schema is "v2".
+    $ref: metrics_v_2_config
   password:
     description: Password is the authentication password.
     $ref: go.opentelemetry.io/collector/config/configopaque.string

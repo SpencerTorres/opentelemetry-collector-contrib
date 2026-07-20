@@ -87,3 +87,17 @@ func TestFactory_CreateMetrics(t *testing.T) {
 
 	require.NoError(t, exporter.Shutdown(t.Context()))
 }
+
+func TestFactory_CreateMetricsV2(t *testing.T) {
+	factory := NewFactory()
+	cfg := withDefaultConfig(func(cfg *Config) {
+		cfg.Endpoint = defaultEndpoint
+		cfg.MetricsSchema = metricsSchemaV2
+	})
+	params := exportertest.NewNopSettings(metadata.Type)
+	exporter, err := factory.CreateMetrics(t.Context(), params, cfg)
+	require.NoError(t, err)
+	require.NotNil(t, exporter)
+
+	require.NoError(t, exporter.Shutdown(t.Context()))
+}

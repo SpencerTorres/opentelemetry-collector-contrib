@@ -83,6 +83,7 @@ func TestMetricsV2Math(t *testing.T) {
 		v2.HistogramPointsTableName, v2.ExpHistogramPointsTableName, v2.SummaryPointsTableName,
 		v2.ExemplarsTableName, v2.PointsTableName + "_5m", v2.PointsTableName + "_1h",
 		v2.HistogramPointsTableName + "_5m", v2.HistogramPointsTableName + "_1h",
+		v2.ExpHistogramPointsTableName + "_5m", v2.ExpHistogramPointsTableName + "_1h",
 	} {
 		require.NoError(t, db.Exec(t.Context(), fmt.Sprintf("OPTIMIZE TABLE otel_int_test.%q FINAL", table)))
 	}
@@ -96,6 +97,7 @@ func TestMetricsV2Math(t *testing.T) {
 	t.Run("SummaryQueries", func(t *testing.T) { mathTestSummary(t, exp1) })
 	t.Run("Rollups", func(t *testing.T) { mathTestRollups(t, exp1) })
 	t.Run("HistogramRollups", func(t *testing.T) { mathTestHistogramRollups(t, exp1) })
+	t.Run("ExpHistogramRollups", func(t *testing.T) { mathTestExpHistogramRollups(t, exp1) })
 	t.Run("RangeQueryShape", func(t *testing.T) { mathTestRangeQueryShape(t, exp1) })
 	t.Run("PromQLFunctionFamily", func(t *testing.T) { mathTestPromQLFunctionFamily(t, exp1) })
 	t.Run("FiltersAndMatchers", func(t *testing.T) { mathTestFiltersAndMatchers(t, exp1) })
@@ -1731,4 +1733,633 @@ func mathTestStalenessMarkers(t *testing.T, e *metricsV2Exporter) {
 		`SELECT (argMaxMerge(LastSum) - argMinMerge(FirstSum)) / (argMaxMerge(LastCount) - argMinMerge(FirstCount))
 		 FROM otel_int_test.%q WHERE MetricName = 'stale.duration' AND %s`,
 		v2.HistogramPointsTableName+"_5m", histSeries)), 1e-9)
+}
+
+// mathTestExpHistogramRollups validates the exponential histogram rollup tiers
+// (5m + 1h). Exp-histogram buckets are not positionally aligned across points
+// (Scale and Offset may vary), so the tier differs from the explicit-bounds
+// one in two load-bearing ways:
+//
+//  1. Scale is part of the aggregation key (ORDER BY ... TimeBucket, Scale):
+//     states only ever merge within one scale, which keeps every state exact
+//     under arbitrary merge order. A series that changes scale inside a bucket
+//     yields one row per scale; the query layer downscale-merges those rows to
+//     the minimum scale (k' = floor(k / 2^(s - target))) — the §5.6 math over
+//     rollup rows instead of raw points.
+//  2. Bucket counts are stored as Map(absolute bucket index -> count), where
+//     the absolute index is Offset + i. Map sums (sumMap) are additive under
+//     any per-point offset drift; a fixed-offset array via sumForEach would
+//     silently sum counts of different value ranges when offsets move.
+//
+// Delta temporality reads the additive Sum* columns (exact by construction);
+// cumulative reads the First/Last tuples (one consistent argMin/argMax
+// snapshot of time+count+sum+zerocount+bucket maps) and chains them like the
+// counter/histogram recipes. The reset caveat mirrors §7.1: chaining detects
+// resets between the tier's buckets, so a reset strictly inside one bucket
+// under-counts that bucket — asserted both ways below (exact at 5m where the
+// reset falls on a bucket boundary, under-counted at 1h where it is interior).
+//
+// Data (expT0 = 2024-01-05, 15s scrapes, own metric names; the payload is
+// pushed 5 times concurrently = the retry-dedup regression for the new MVs):
+//
+//	exph.delta.requests (delta) svc-a{method=Get}, scale 2, 40 points:
+//	  even i: pos offset 0 counts [10 20 30], neg offset 0 counts [4],
+//	          zero 1, count 65, sum 100
+//	  odd  i: pos offset 1 counts [20 30 5], no negatives,
+//	          zero 1, count 56, sum 120        (offset drift within buckets)
+//	exph.cum.latency (cumulative) svc-a{region=x}, scale 2, offset 1, 40 points:
+//	  n = i+1 for i<20, n = i-19 for i>=20 (reset at the 5m boundary i=20):
+//	  buckets [2n 3n n], zero n, count 7n, sum 3.5n
+//	exph.scale.change (delta) svc-a{pod=1}, 20 points, one 5m bucket:
+//	  i<10: scale 2, counts [8 4], zero 2, count 14
+//	  i>=10: scale 1, counts [12 6], zero 1, count 19
+//	exph.zero.only (delta) svc-a{kind=zero}, 10 points, no positive buckets:
+//	  even i: only zero counts (5); odd i: zero 3 + negative offset -1 [2 2]
+//	exph.stale (delta) svc-a{job=s}: 10 real points + trailing marker (Flags=1)
+func mathTestExpHistogramRollups(t *testing.T, e *metricsV2Exporter) {
+	v2 := &e.cfg.MetricsV2
+	table5m := v2.ExpHistogramPointsTableName + "_5m"
+	table1h := v2.ExpHistogramPointsTableName + "_1h"
+
+	expT0 := time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)
+	ts := func(i int) pcommon.Timestamp {
+		return pcommon.NewTimestampFromTime(expT0.Add(time.Duration(i) * mathScrapeInterval))
+	}
+	start := pcommon.NewTimestampFromTime(expT0)
+	noValue := pmetric.DefaultDataPointFlags.WithNoRecordedValue(true)
+
+	payload := func() pmetric.Metrics {
+		md := pmetric.NewMetrics()
+		rm := md.ResourceMetrics().AppendEmpty()
+		rm.Resource().Attributes().PutStr("service.name", "svc-a")
+		sm := rm.ScopeMetrics().AppendEmpty()
+		sm.Scope().SetName("mathtest")
+		sm.Scope().SetVersion("1.0")
+
+		// Delta with per-point offset drift, negative buckets, and zero counts.
+		{
+			m := sm.Metrics().AppendEmpty()
+			m.SetName("exph.delta.requests")
+			m.SetUnit("s")
+			h := m.SetEmptyExponentialHistogram()
+			h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			for i := 0; i < 40; i++ {
+				dp := h.DataPoints().AppendEmpty()
+				dp.SetTimestamp(ts(i))
+				dp.SetStartTimestamp(ts(i - 1))
+				dp.SetScale(2)
+				dp.SetZeroCount(1)
+				dp.SetZeroThreshold(0.001)
+				dp.SetMin(0.5)
+				dp.SetMax(3.0)
+				if i%2 == 0 {
+					dp.Positive().SetOffset(0)
+					dp.Positive().BucketCounts().FromRaw([]uint64{10, 20, 30})
+					dp.Negative().SetOffset(0)
+					dp.Negative().BucketCounts().FromRaw([]uint64{4})
+					dp.SetCount(65) // 1 zero + 60 positive + 4 negative
+					dp.SetSum(100)
+				} else {
+					dp.Positive().SetOffset(1)
+					dp.Positive().BucketCounts().FromRaw([]uint64{20, 30, 5})
+					dp.SetCount(56) // 1 zero + 55 positive
+					dp.SetSum(120)
+				}
+				dp.Attributes().PutStr("method", "Get")
+			}
+		}
+
+		// Cumulative with a reset at the 5m bucket boundary (i=20).
+		{
+			m := sm.Metrics().AppendEmpty()
+			m.SetName("exph.cum.latency")
+			m.SetUnit("s")
+			h := m.SetEmptyExponentialHistogram()
+			h.SetAggregationTemporality(pmetric.AggregationTemporalityCumulative)
+			for i := 0; i < 40; i++ {
+				n := uint64(i + 1)
+				if i >= 20 {
+					n = uint64(i - 19)
+				}
+				dp := h.DataPoints().AppendEmpty()
+				dp.SetTimestamp(ts(i))
+				dp.SetStartTimestamp(start)
+				dp.SetScale(2)
+				dp.SetZeroCount(n)
+				dp.SetZeroThreshold(0.001)
+				dp.Positive().SetOffset(1)
+				dp.Positive().BucketCounts().FromRaw([]uint64{2 * n, 3 * n, n})
+				dp.SetCount(7 * n) // n zero + 6n positive
+				dp.SetSum(3.5 * float64(n))
+				dp.SetMin(0.1)
+				dp.SetMax(9)
+				dp.Attributes().PutStr("region", "x")
+			}
+		}
+
+		// Scale change inside one 5m bucket.
+		{
+			m := sm.Metrics().AppendEmpty()
+			m.SetName("exph.scale.change")
+			m.SetUnit("s")
+			h := m.SetEmptyExponentialHistogram()
+			h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			for i := 0; i < 20; i++ {
+				dp := h.DataPoints().AppendEmpty()
+				dp.SetTimestamp(ts(i))
+				dp.SetStartTimestamp(ts(i - 1))
+				dp.Positive().SetOffset(0)
+				if i < 10 {
+					dp.SetScale(2)
+					dp.Positive().BucketCounts().FromRaw([]uint64{8, 4})
+					dp.SetZeroCount(2)
+					dp.SetCount(14)
+				} else {
+					dp.SetScale(1)
+					dp.Positive().BucketCounts().FromRaw([]uint64{12, 6})
+					dp.SetZeroCount(1)
+					dp.SetCount(19)
+				}
+				dp.SetSum(10)
+				dp.Attributes().PutStr("pod", "1")
+			}
+		}
+
+		// Zero-bucket-only and empty-positive-array points.
+		{
+			m := sm.Metrics().AppendEmpty()
+			m.SetName("exph.zero.only")
+			m.SetUnit("s")
+			h := m.SetEmptyExponentialHistogram()
+			h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			for i := 0; i < 10; i++ {
+				dp := h.DataPoints().AppendEmpty()
+				dp.SetTimestamp(ts(i))
+				dp.SetStartTimestamp(ts(i - 1))
+				dp.SetScale(2)
+				dp.SetZeroThreshold(0.01)
+				if i%2 == 0 {
+					dp.SetZeroCount(5)
+					dp.SetCount(5)
+					dp.SetSum(0)
+				} else {
+					dp.SetZeroCount(3)
+					dp.Negative().SetOffset(-1)
+					dp.Negative().BucketCounts().FromRaw([]uint64{2, 2})
+					dp.SetCount(7)
+					dp.SetSum(-4.5)
+				}
+				dp.Attributes().PutStr("kind", "zero")
+			}
+		}
+
+		// Staleness: 10 real points, then a NoRecordedValue marker.
+		{
+			m := sm.Metrics().AppendEmpty()
+			m.SetName("exph.stale")
+			m.SetUnit("s")
+			h := m.SetEmptyExponentialHistogram()
+			h.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+			for i := 0; i <= 10; i++ {
+				dp := h.DataPoints().AppendEmpty()
+				dp.SetTimestamp(ts(i))
+				dp.SetStartTimestamp(ts(i - 1))
+				dp.Attributes().PutStr("job", "s")
+				if i == 10 {
+					dp.SetFlags(noValue)
+					dp.SetScale(0)
+					dp.SetCount(0)
+					dp.SetSum(0)
+				} else {
+					dp.SetScale(2)
+					dp.Positive().SetOffset(0)
+					dp.Positive().BucketCounts().FromRaw([]uint64{1, 1})
+					dp.SetCount(2)
+					dp.SetSum(1)
+					dp.SetMin(0.25)
+					dp.SetMax(4)
+				}
+			}
+		}
+
+		return md
+	}
+
+	// 5 byte-identical concurrent pushes = the exporterhelper retry shape;
+	// every count below asserts single-insert totals through the new MV chain.
+	md := payload()
+	pushConcurrentlyNoError(t, func() error {
+		return e.pushMetricsData(t.Context(), md)
+	})
+
+	// The exp-histogram quantile interpolation shared by every recipe below:
+	// bucket k covers (base^k, base^(k+1)] with base = 2^(2^-scale); the inner
+	// query must yield sorted (ks, vs) arrays of absolute indexes and counts
+	// plus the scale-derived base.
+	interp := func(inner string) string {
+		return fmt.Sprintf(
+			`SELECT lower + (upper - lower) * (rank - prevCum) / cnt
+			 FROM (
+			     SELECT base, ks, vs,
+			            arrayCumSum(vs) AS cum,
+			            arraySum(vs) * 0.5 AS rank,
+			            arrayFirstIndex(c -> c >= rank, cum) AS idx,
+			            if(idx = 1, 0., cum[idx - 1]) AS prevCum,
+			            vs[idx] AS cnt,
+			            pow(base, ks[idx]) AS lower,
+			            pow(base, ks[idx] + 1) AS upper
+			     FROM (%s)
+			 )`, inner)
+	}
+
+	// Sorted key/count arrays from a per-scale (Scale, m Map) row set with a
+	// single scale in play.
+	fromMap := func(perScale string) string {
+		return fmt.Sprintf(
+			`SELECT pow(2, pow(2, -Scale)) AS base,
+			        mapKeys(m) AS ks, arrayMap(v -> toFloat64(v), mapValues(m)) AS vs
+			 FROM (%s)`, perScale)
+	}
+
+	// The raw-tier map shape: absolute-index bucket map per point (§5.6 with
+	// offset made explicit), summed over the window.
+	rawDeltaPerScale := func(metric, from, to string) string {
+		return fmt.Sprintf(
+			`SELECT Scale, sumMap(mapFilter((k, cnt) -> cnt != 0, mapFromArrays(
+			            arrayMap(i -> toInt32(PositiveOffset + toInt32(i) - 1), arrayEnumerate(PositiveBucketCounts)),
+			            PositiveBucketCounts))) AS m
+			 FROM otel_int_test.%q
+			 WHERE MetricName = '%s' AND bitAnd(Flags, 1) = 0
+			   AND TimeUnix >= toDateTime('%s', 'UTC') AND TimeUnix < toDateTime('%s', 'UTC')
+			 GROUP BY Scale`, v2.ExpHistogramPointsTableName, metric, from, to)
+	}
+
+	scanMap := func(query string, args ...any) map[int32]uint64 {
+		t.Helper()
+		row := e.db.QueryRow(t.Context(), query, args...)
+		require.NoError(t, row.Err())
+		var m map[int32]uint64
+		require.NoError(t, row.Scan(&m))
+		return m
+	}
+
+	verify := func(t *testing.T, optimized bool) {
+		// --- Raw fidelity + retry dedup: single-insert counts everywhere ---
+		for metric, points := range map[string]uint64{
+			"exph.delta.requests": 40, "exph.cum.latency": 40,
+			"exph.scale.change": 20, "exph.zero.only": 10, "exph.stale": 11,
+		} {
+			require.Equal(t, points, scanUInt(t, e, fmt.Sprintf(
+				`SELECT count() FROM otel_int_test.%q WHERE MetricName = '%s'`,
+				v2.ExpHistogramPointsTableName, metric)), "raw count for %s", metric)
+		}
+
+		// --- Delta exactness: 5m bucket sums are hand-computed-exact ---
+		// Per 5m bucket (20 points = 10 even + 10 odd):
+		// positive {0:100, 1:400, 2:600, 3:50} (drift-proof absolute keys),
+		// negative {0:40}, zero 20, count 1210, sum 2200, 20 points.
+		type deltaBucket struct {
+			pos, neg            map[int32]uint64
+			zero, count, points uint64
+			sum, min, max, zt   float64
+		}
+		rows, err := e.db.Query(t.Context(), fmt.Sprintf(
+			`SELECT sumMap(SumPositive), sumMap(SumNegative), sum(SumZeroCount), sum(SumCount),
+			        sum(PointCount), sum(SumSum), min(Min), max(Max), max(ZeroThreshold)
+			 FROM otel_int_test.%q WHERE MetricName = 'exph.delta.requests'
+			 GROUP BY TimeBucket ORDER BY TimeBucket`, table5m))
+		require.NoError(t, err)
+		var deltaBuckets []deltaBucket
+		for rows.Next() {
+			var b deltaBucket
+			require.NoError(t, rows.Scan(&b.pos, &b.neg, &b.zero, &b.count, &b.points, &b.sum, &b.min, &b.max, &b.zt))
+			deltaBuckets = append(deltaBuckets, b)
+		}
+		require.NoError(t, rows.Close())
+		require.Len(t, deltaBuckets, 2)
+		for i, b := range deltaBuckets {
+			assert.Equal(t, map[int32]uint64{0: 100, 1: 400, 2: 600, 3: 50}, b.pos, "bucket %d", i)
+			assert.Equal(t, map[int32]uint64{0: 40}, b.neg, "bucket %d", i)
+			assert.Equal(t, uint64(20), b.zero, "bucket %d", i)
+			assert.Equal(t, uint64(1210), b.count, "bucket %d", i)
+			assert.Equal(t, uint64(20), b.points, "bucket %d", i)
+			assert.InDelta(t, 2200.0, b.sum, 1e-9, "bucket %d", i)
+			assert.InDelta(t, 0.5, b.min, 1e-9, "bucket %d", i)
+			assert.InDelta(t, 3.0, b.max, 1e-9, "bucket %d", i)
+			assert.InDelta(t, 0.001, b.zt, 1e-12, "bucket %d", i)
+		}
+
+		// The 1h cascade doubles every additive column.
+		assert.Equal(t, map[int32]uint64{0: 200, 1: 800, 2: 1200, 3: 100}, scanMap(fmt.Sprintf(
+			`SELECT sumMap(SumPositive) FROM otel_int_test.%q WHERE MetricName = 'exph.delta.requests'`, table1h)))
+		assert.Equal(t, map[int32]uint64{0: 80}, scanMap(fmt.Sprintf(
+			`SELECT sumMap(SumNegative) FROM otel_int_test.%q WHERE MetricName = 'exph.delta.requests'`, table1h)))
+		require.Equal(t, uint64(2420), scanUInt(t, e, fmt.Sprintf(
+			`SELECT sum(SumCount) FROM otel_int_test.%q WHERE MetricName = 'exph.delta.requests'`, table1h)))
+		require.Equal(t, uint64(40), scanUInt(t, e, fmt.Sprintf(
+			`SELECT sum(SumZeroCount) FROM otel_int_test.%q WHERE MetricName = 'exph.delta.requests'`, table1h)))
+		assert.InDelta(t, 4400.0, scanFloat(t, e, fmt.Sprintf(
+			`SELECT sum(SumSum) FROM otel_int_test.%q WHERE MetricName = 'exph.delta.requests'`, table1h)), 1e-9)
+
+		// Delta window quantile from the rollup equals the raw-tier value
+		// EXACTLY (same scale, identical bucket sums by construction) and the
+		// hand-computed interpolation: positive totals per bucket-0 window
+		// cum [100 500 1100 1150], rank 575 -> k=2: sqrt(2) + (2^0.75 -
+		// sqrt(2)) * (575-500)/600.
+		expQ50 := math.Sqrt2 + (math.Pow(2, 0.75)-math.Sqrt2)*0.125
+		rollupQ50 := scanFloat(t, e, interp(fromMap(fmt.Sprintf(
+			`SELECT Scale, sumMap(SumPositive) AS m FROM otel_int_test.%q
+			 WHERE MetricName = 'exph.delta.requests' AND TimeBucket = toDateTime('2024-01-05 00:00:00', 'UTC')
+			 GROUP BY Scale`, table5m))))
+		rawQ50 := scanFloat(t, e, interp(fromMap(
+			rawDeltaPerScale("exph.delta.requests", "2024-01-05 00:00:00", "2024-01-05 00:05:00"))))
+		assert.InDelta(t, expQ50, rollupQ50, 1e-12)
+		assert.InDelta(t, expQ50, rawQ50, 1e-12)
+		assert.InDelta(t, rawQ50, rollupQ50, 1e-15, "rollup and raw quantiles must agree exactly at one scale")
+
+		// Delta avg latency from the rollup scalars: 4400/2420.
+		assert.InDelta(t, 4400.0/2420.0, scanFloat(t, e, fmt.Sprintf(
+			`SELECT sum(SumSum) / sum(SumCount) FROM otel_int_test.%q
+			 WHERE MetricName = 'exph.delta.requests'`, table5m)), 1e-12)
+
+		// --- Cumulative: First/Last tuples are consistent snapshots ---
+		// Bucket 0: first sample i=0 (n=1), last i=19 (n=20); bucket 1: the
+		// reset restarts n at 1 (i=20) and climbs back to 20 (i=39).
+		type snap struct {
+			fTime, lTime                 time.Time
+			fCount, lCount, fZero, lZero uint64
+			fSum, lSum                   float64
+			fPos, lPos                   map[int32]uint64
+		}
+		rows, err = e.db.Query(t.Context(), fmt.Sprintf(
+			`SELECT tupleElement(argMinMerge(First), 'Time'), tupleElement(argMaxMerge(Last), 'Time'),
+			        tupleElement(argMinMerge(First), 'Count'), tupleElement(argMaxMerge(Last), 'Count'),
+			        tupleElement(argMinMerge(First), 'ZeroCount'), tupleElement(argMaxMerge(Last), 'ZeroCount'),
+			        tupleElement(argMinMerge(First), 'Sum'), tupleElement(argMaxMerge(Last), 'Sum'),
+			        tupleElement(argMinMerge(First), 'PositiveBuckets'), tupleElement(argMaxMerge(Last), 'PositiveBuckets')
+			 FROM otel_int_test.%q WHERE MetricName = 'exph.cum.latency'
+			 GROUP BY TimeBucket ORDER BY TimeBucket`, table5m))
+		require.NoError(t, err)
+		var snaps []snap
+		for rows.Next() {
+			var s snap
+			require.NoError(t, rows.Scan(&s.fTime, &s.lTime, &s.fCount, &s.lCount,
+				&s.fZero, &s.lZero, &s.fSum, &s.lSum, &s.fPos, &s.lPos))
+			snaps = append(snaps, s)
+		}
+		require.NoError(t, rows.Close())
+		require.Len(t, snaps, 2)
+		for i, s := range snaps {
+			base := time.Duration(i) * 300 * time.Second
+			assert.Equal(t, expT0.Add(base), s.fTime.UTC(), "bucket %d", i)
+			assert.Equal(t, expT0.Add(base+285*time.Second), s.lTime.UTC(), "bucket %d", i)
+			assert.Equal(t, uint64(7), s.fCount, "bucket %d", i)
+			assert.Equal(t, uint64(140), s.lCount, "bucket %d", i)
+			assert.Equal(t, uint64(1), s.fZero, "bucket %d", i)
+			assert.Equal(t, uint64(20), s.lZero, "bucket %d", i)
+			assert.InDelta(t, 3.5, s.fSum, 1e-9, "bucket %d", i)
+			assert.InDelta(t, 70.0, s.lSum, 1e-9, "bucket %d", i)
+			assert.Equal(t, map[int32]uint64{1: 2, 2: 3, 3: 1}, s.fPos, "bucket %d", i)
+			assert.Equal(t, map[int32]uint64{1: 40, 2: 60, 3: 20}, s.lPos, "bucket %d", i)
+		}
+
+		// Chained per-bucket-index increase across 5m buckets (the exp-hist
+		// analog of the counter/histogram First/Last chaining; missing map
+		// keys read as 0). Expected: within-bucket (L-F) = {1:38, 2:57, 3:19}
+		// twice, plus the detected reset re-adds bucket 1's First {1:2, 2:3,
+		// 3:1} => {1:78, 2:117, 3:39}.
+		chainedIncreases := func(table string) string {
+			return fmt.Sprintf(
+				`WITH per_bucket AS (
+				     SELECT TimeBucket,
+				            tupleElement(argMinMerge(First), 'PositiveBuckets') AS fPos,
+				            tupleElement(argMaxMerge(Last), 'PositiveBuckets') AS lPos
+				     FROM otel_int_test.%q WHERE MetricName = 'exph.cum.latency'
+				     GROUP BY TimeBucket
+				 ),
+				 keys AS (SELECT arrayDistinct(arrayFlatten(groupArray(arrayConcat(mapKeys(fPos), mapKeys(lPos))))) AS ks FROM per_bucket)
+				 SELECT k, sum(inc) AS total FROM (
+				     SELECT k, TimeBucket, toFloat64(fPos[k]) AS F, toFloat64(lPos[k]) AS L,
+				         lagInFrame(L, 1) OVER w AS prevL,
+				         row_number() OVER w AS rn,
+				         if(rn = 1, L - F, if(F >= prevL, F - prevL, F) + (L - F)) AS inc
+				     FROM per_bucket, keys ARRAY JOIN ks AS k
+				     WINDOW w AS (PARTITION BY k ORDER BY TimeBucket ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+				 ) GROUP BY k`, table)
+		}
+		scanIncreases := func(query string) map[int32]float64 {
+			t.Helper()
+			rows, err := e.db.Query(t.Context(), query)
+			require.NoError(t, err)
+			got := map[int32]float64{}
+			for rows.Next() {
+				var k int32
+				var v float64
+				require.NoError(t, rows.Scan(&k, &v))
+				got[k] = v
+			}
+			require.NoError(t, rows.Close())
+			return got
+		}
+		assert.Equal(t, map[int32]float64{1: 78, 2: 117, 3: 39}, scanIncreases(chainedIncreases(table5m)))
+
+		// The same chaining on the 1h tier under-counts: the reset is strictly
+		// inside the single 1h bucket, so L-F = {1:38, 2:57, 3:19} — the §7.1
+		// mid-bucket-reset residual, one tier coarser. Route cumulative
+		// increase queries to the finest tier whose buckets expose the reset.
+		assert.Equal(t, map[int32]float64{1: 38, 2: 57, 3: 19}, scanIncreases(chainedIncreases(table1h)),
+			"1h chaining is blind to the in-hour reset by design (mirror of the §7.1 residual)")
+
+		// Chained scalar increases from the 5m tuples: Count 133+7+133 = 273,
+		// ZeroCount 19+1+19 = 39, Sum 66.5+3.5+66.5 = 136.5.
+		chainedScalar := func(field string) float64 {
+			return scanFloat(t, e, fmt.Sprintf(
+				`SELECT sum(inc) FROM (
+				     SELECT F, L,
+				         lagInFrame(L, 1) OVER w AS prevL,
+				         row_number() OVER w AS rn,
+				         if(rn = 1, L - F, if(F >= prevL, F - prevL, F) + (L - F)) AS inc
+				     FROM (
+				         SELECT TimeBucket,
+				                toFloat64(tupleElement(argMinMerge(First), '%s')) AS F,
+				                toFloat64(tupleElement(argMaxMerge(Last), '%s')) AS L
+				         FROM otel_int_test.%q WHERE MetricName = 'exph.cum.latency'
+				         GROUP BY TimeBucket
+				     )
+				     WINDOW w AS (ORDER BY TimeBucket ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+				 )`, field, field, table5m))
+		}
+		assert.InDelta(t, 273.0, chainedScalar("Count"), 1e-9)
+		assert.InDelta(t, 39.0, chainedScalar("ZeroCount"), 1e-9)
+		assert.InDelta(t, 136.5, chainedScalar("Sum"), 1e-9)
+
+		// Quantile of the chained increase from the rollup tier equals the
+		// hand-computed interpolation over {1:78, 2:117, 3:39}: cum [78 195
+		// 234], rank 117 -> k=2: sqrt(2) + (2^0.75 - sqrt(2)) * 39/117.
+		expCumQ50 := math.Sqrt2 + (math.Pow(2, 0.75)-math.Sqrt2)*(39.0/117.0)
+		rollupCumQ50 := scanFloat(t, e, interp(fmt.Sprintf(
+			`SELECT pow(2, pow(2, -(SELECT any(Scale) FROM otel_int_test.%q WHERE MetricName = 'exph.cum.latency'))) AS base,
+			        arrayMap(t -> t.1, arraySort(t -> t.1, groupArray((k, total)))) AS ks,
+			        arrayMap(t -> t.2, arraySort(t -> t.1, groupArray((k, total)))) AS vs
+			 FROM (%s)`, table5m, chainedIncreases(table5m))))
+		assert.InDelta(t, expCumQ50, rollupCumQ50, 1e-12)
+
+		// --- The UI's branched RAW cumulative shape (executable reference) ---
+		// Per (SeriesHash, TimeUnix) dedup emits the max-Count sample as ONE
+		// consistent tuple (argMax((buckets, offset), Count)), then lag-window
+		// differencing per absolute bucket index with Count-based reset
+		// detection. Must reproduce the same increases and quantile as the
+		// rollup chaining above, reset included.
+		rawBranched := fmt.Sprintf(
+			`WITH samples AS (
+			     SELECT TimeUnix,
+			            argMax((PositiveBucketCounts, PositiveOffset), Count) AS pb,
+			            max(Count) AS c,
+			            mapFromArrays(arrayMap(i -> toInt32(pb.2 + toInt32(i) - 1), arrayEnumerate(pb.1)), pb.1) AS cur
+			     FROM otel_int_test.%q
+			     WHERE MetricName = 'exph.cum.latency' AND bitAnd(Flags, 1) = 0
+			     GROUP BY SeriesHash, TimeUnix
+			 ),
+			 keys AS (SELECT arrayDistinct(arrayFlatten(groupArray(mapKeys(cur)))) AS ks FROM samples)
+			 SELECT k, sum(inc) AS total FROM (
+			     SELECT k, TimeUnix, toFloat64(cur[k]) AS v, c,
+			         lagInFrame(v, 1) OVER w AS prevV,
+			         lagInFrame(c, 1) OVER w AS prevC,
+			         row_number() OVER w AS rn,
+			         multiIf(rn = 1, 0., c >= prevC, v - prevV, v) AS inc
+			     FROM samples, keys ARRAY JOIN ks AS k
+			     WINDOW w AS (PARTITION BY k ORDER BY TimeUnix ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+			 ) GROUP BY k`, v2.ExpHistogramPointsTableName)
+		assert.Equal(t, map[int32]float64{1: 78, 2: 117, 3: 39}, scanIncreases(rawBranched))
+		rawCumQ50 := scanFloat(t, e, interp(fmt.Sprintf(
+			`SELECT pow(2, pow(2, -(SELECT any(Scale) FROM otel_int_test.%q WHERE MetricName = 'exph.cum.latency'))) AS base,
+			        arrayMap(t -> t.1, arraySort(t -> t.1, groupArray((k, total)))) AS ks,
+			        arrayMap(t -> t.2, arraySort(t -> t.1, groupArray((k, total)))) AS vs
+			 FROM (%s)`, v2.ExpHistogramPointsTableName, rawBranched)))
+		assert.InDelta(t, expCumQ50, rawCumQ50, 1e-12)
+		assert.InDelta(t, rawCumQ50, rollupCumQ50, 1e-15, "raw branched shape and rollup chaining must agree exactly")
+
+		// --- Scale change: one exact row per scale, merged at query time ---
+		type scaleRow struct {
+			pos                 map[int32]uint64
+			zero, count, points uint64
+		}
+		scaleRows := map[int8]scaleRow{}
+		rows, err = e.db.Query(t.Context(), fmt.Sprintf(
+			`SELECT Scale, sumMap(SumPositive), sum(SumZeroCount), sum(SumCount), sum(PointCount)
+			 FROM otel_int_test.%q WHERE MetricName = 'exph.scale.change'
+			 GROUP BY Scale ORDER BY Scale`, table5m))
+		require.NoError(t, err)
+		for rows.Next() {
+			var scale int8
+			var r scaleRow
+			require.NoError(t, rows.Scan(&scale, &r.pos, &r.zero, &r.count, &r.points))
+			scaleRows[scale] = r
+		}
+		require.NoError(t, rows.Close())
+		require.Len(t, scaleRows, 2)
+		assert.Equal(t, scaleRow{pos: map[int32]uint64{0: 120, 1: 60}, zero: 10, count: 190, points: 10}, scaleRows[1])
+		assert.Equal(t, scaleRow{pos: map[int32]uint64{0: 80, 1: 40}, zero: 20, count: 140, points: 10}, scaleRows[2])
+
+		if optimized {
+			// After OPTIMIZE FINAL the states must have merged per-scale:
+			// exactly one physical row per (bucket, scale) — the Scale-in-key
+			// design means merges never cross scales.
+			require.Equal(t, uint64(2), scanUInt(t, e, fmt.Sprintf(
+				`SELECT count() FROM otel_int_test.%q WHERE MetricName = 'exph.scale.change'`, table5m)))
+			require.Equal(t, uint64(2), scanUInt(t, e, fmt.Sprintf(
+				`SELECT count() FROM otel_int_test.%q WHERE MetricName = 'exph.scale.change'`, table1h)))
+		}
+
+		// Query-layer downscale-merge to the minimum scale (k' = floor(k /
+		// 2^(s-target))): scale-2 {0:80, 1:40} folds into scale-1 index 0,
+		// giving {0:240, 1:60}. q50: rank 150, cum [240 300] -> k=0 at scale 1:
+		// 1 + (sqrt(2) - 1) * 150/240. Must match the identical math over raw.
+		downscaleQuantile := func(perScale string) string {
+			return interp(fmt.Sprintf(
+				`SELECT pow(2, pow(2, -(SELECT min(Scale) FROM per_scale))) AS base,
+				        arrayMap(t -> t.1, arraySort(t -> t.1, groupArray((k2, toFloat64(v2))))) AS ks,
+				        arrayMap(t -> t.2, arraySort(t -> t.1, groupArray((k2, toFloat64(v2))))) AS vs
+				 FROM (
+				     SELECT toInt32(floor(k / exp2(Scale - (SELECT min(Scale) FROM per_scale)))) AS k2, sum(v) AS v2
+				     FROM per_scale ARRAY JOIN mapKeys(m) AS k, mapValues(m) AS v
+				     GROUP BY k2
+				 )`))
+		}
+		withPerScale := func(perScale, outer string) string {
+			return fmt.Sprintf("WITH per_scale AS (%s) %s", perScale, outer)
+		}
+		expScaleQ50 := 1 + (math.Sqrt2-1)*(150.0/240.0)
+		rollupScaleQ50 := scanFloat(t, e, withPerScale(fmt.Sprintf(
+			`SELECT Scale, sumMap(SumPositive) AS m FROM otel_int_test.%q
+			 WHERE MetricName = 'exph.scale.change' GROUP BY Scale`, table5m),
+			downscaleQuantile("per_scale")))
+		rawScaleQ50 := scanFloat(t, e, withPerScale(
+			rawDeltaPerScale("exph.scale.change", "2024-01-05 00:00:00", "2024-01-05 00:05:00"),
+			downscaleQuantile("per_scale")))
+		assert.InDelta(t, expScaleQ50, rollupScaleQ50, 1e-12)
+		assert.InDelta(t, rawScaleQ50, rollupScaleQ50, 1e-15, "downscale-merge over rollup rows equals the raw §5.6 math")
+
+		// --- Zero-only and empty-positive-array points ---
+		var zPos, zNeg map[int32]uint64
+		var zZero, zCount, zPoints uint64
+		var zSum, zThresh float64
+		row := e.db.QueryRow(t.Context(), fmt.Sprintf(
+			`SELECT sumMap(SumPositive), sumMap(SumNegative), sum(SumZeroCount), sum(SumCount),
+			        sum(PointCount), sum(SumSum), max(ZeroThreshold)
+			 FROM otel_int_test.%q WHERE MetricName = 'exph.zero.only'`, table5m))
+		require.NoError(t, row.Err())
+		require.NoError(t, row.Scan(&zPos, &zNeg, &zZero, &zCount, &zPoints, &zSum, &zThresh))
+		assert.Empty(t, zPos, "no positive buckets anywhere in the series")
+		assert.Equal(t, map[int32]uint64{-1: 10, 0: 10}, zNeg)
+		assert.Equal(t, uint64(40), zZero)
+		assert.Equal(t, uint64(60), zCount)
+		assert.Equal(t, uint64(10), zPoints)
+		assert.InDelta(t, -22.5, zSum, 1e-9)
+		assert.InDelta(t, 0.01, zThresh, 1e-12)
+
+		// --- Staleness: the marker never reaches the rollups ---
+		require.Equal(t, uint64(1), scanUInt(t, e, fmt.Sprintf(
+			`SELECT count() FROM otel_int_test.%q WHERE MetricName = 'exph.stale' AND bitAnd(Flags, 1) = 1`,
+			v2.ExpHistogramPointsTableName)), "raw keeps the marker row")
+		for _, table := range []string{table5m, table1h} {
+			require.Equal(t, uint64(10), scanUInt(t, e, fmt.Sprintf(
+				`SELECT sum(PointCount) FROM otel_int_test.%q WHERE MetricName = 'exph.stale'`, table)), "%s", table)
+			require.Equal(t, uint64(20), scanUInt(t, e, fmt.Sprintf(
+				`SELECT sum(SumCount) FROM otel_int_test.%q WHERE MetricName = 'exph.stale'`, table)), "%s", table)
+			require.Equal(t, uint64(0), scanUInt(t, e, fmt.Sprintf(
+				`SELECT count() FROM otel_int_test.%q WHERE MetricName = 'exph.stale' AND Scale = 0`, table)),
+				"the marker's zeroed Scale must not create a rollup row (%s)", table)
+			assert.Equal(t, map[int32]uint64{0: 10, 1: 10}, scanMap(fmt.Sprintf(
+				`SELECT sumMap(SumPositive) FROM otel_int_test.%q WHERE MetricName = 'exph.stale'`, table)), "%s", table)
+		}
+		assert.InDelta(t, 0.25, scanFloat(t, e, fmt.Sprintf(
+			`SELECT min(Min) FROM otel_int_test.%q WHERE MetricName = 'exph.stale'`, table5m)), 1e-9,
+			"the marker's zeroed Min is excluded")
+		assert.InDelta(t, 4.0, scanFloat(t, e, fmt.Sprintf(
+			`SELECT max(Max) FROM otel_int_test.%q WHERE MetricName = 'exph.stale'`, table5m)), 1e-9)
+
+		// --- Coverage: both tiers account for every non-marker raw point ---
+		for _, metric := range []string{
+			"exph.delta.requests", "exph.cum.latency", "exph.scale.change", "exph.zero.only", "exph.stale",
+		} {
+			rawPoints := scanUInt(t, e, fmt.Sprintf(
+				`SELECT count() FROM otel_int_test.%q WHERE MetricName = '%s' AND bitAnd(Flags, 1) = 0`,
+				v2.ExpHistogramPointsTableName, metric))
+			for _, table := range []string{table5m, table1h} {
+				require.Equal(t, rawPoints, scanUInt(t, e, fmt.Sprintf(
+					`SELECT sum(PointCount) FROM otel_int_test.%q WHERE MetricName = '%s'`, table, metric)),
+					"%s must cover every raw point of %s exactly once", table, metric)
+			}
+		}
+	}
+
+	// The GROUP BY + -Merge/sumMap read forms must be exact regardless of
+	// merge state: verify on the freshly-inserted parts first, then force
+	// merges and verify the collapsed states converged to the same values.
+	verify(t, false)
+	for _, table := range []string{v2.ExpHistogramPointsTableName, table5m, table1h} {
+		require.NoError(t, e.db.Exec(t.Context(), fmt.Sprintf("OPTIMIZE TABLE otel_int_test.%q FINAL", table)))
+	}
+	verify(t, true)
 }

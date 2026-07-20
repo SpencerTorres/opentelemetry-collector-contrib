@@ -92,6 +92,11 @@ func verifyExporterMetricsV2(t *testing.T, exporter *metricsV2Exporter) {
 	require.Equal(t, uint64(pointsPerType), count("SELECT sum(PointCount) FROM "+table(v2.HistogramPointsTableName+"_5m")))
 	require.Equal(t, uint64(pointsPerType), count("SELECT sum(PointCount) FROM "+table(v2.HistogramPointsTableName+"_1h")))
 
+	// And the exponential histogram rollups: single-insert point coverage in
+	// both tiers (the MV double-count trap under retries).
+	require.Equal(t, uint64(pointsPerType), count("SELECT sum(PointCount) FROM "+table(v2.ExpHistogramPointsTableName+"_5m")))
+	require.Equal(t, uint64(pointsPerType), count("SELECT sum(PointCount) FROM "+table(v2.ExpHistogramPointsTableName+"_1h")))
+
 	verifyMetricsV2SeriesRow(t, exporter)
 }
 

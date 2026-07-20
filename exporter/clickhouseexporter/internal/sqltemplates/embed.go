@@ -190,6 +190,18 @@ var MetricsV2HistogramPoints1hCreateTable string
 //go:embed metrics_v2_histogram_points_1h_mv.sql
 var MetricsV2HistogramPoints1hCreateView string
 
+//go:embed metrics_v2_exp_histogram_points_5m_table.sql
+var MetricsV2ExpHistogramPoints5mCreateTable string
+
+//go:embed metrics_v2_exp_histogram_points_5m_mv.sql
+var MetricsV2ExpHistogramPoints5mCreateView string
+
+//go:embed metrics_v2_exp_histogram_points_1h_table.sql
+var MetricsV2ExpHistogramPoints1hCreateTable string
+
+//go:embed metrics_v2_exp_histogram_points_1h_mv.sql
+var MetricsV2ExpHistogramPoints1hCreateView string
+
 // Parsed templates for the metrics v2 schema (text/template).
 var (
 	MetricsV2SeriesCreateTableTmpl             = newTemplate("metrics_v2_series_table", MetricsV2SeriesCreateTable)
@@ -214,6 +226,11 @@ var (
 	MetricsV2HistogramPoints5mCreateViewTmpl   = newTemplate("metrics_v2_histogram_points_5m_mv", MetricsV2HistogramPoints5mCreateView)
 	MetricsV2HistogramPoints1hCreateTableTmpl  = newTemplate("metrics_v2_histogram_points_1h_table", MetricsV2HistogramPoints1hCreateTable)
 	MetricsV2HistogramPoints1hCreateViewTmpl   = newTemplate("metrics_v2_histogram_points_1h_mv", MetricsV2HistogramPoints1hCreateView)
+
+	MetricsV2ExpHistogramPoints5mCreateTableTmpl = newTemplate("metrics_v2_exp_histogram_points_5m_table", MetricsV2ExpHistogramPoints5mCreateTable)
+	MetricsV2ExpHistogramPoints5mCreateViewTmpl  = newTemplate("metrics_v2_exp_histogram_points_5m_mv", MetricsV2ExpHistogramPoints5mCreateView)
+	MetricsV2ExpHistogramPoints1hCreateTableTmpl = newTemplate("metrics_v2_exp_histogram_points_1h_table", MetricsV2ExpHistogramPoints1hCreateTable)
+	MetricsV2ExpHistogramPoints1hCreateViewTmpl  = newTemplate("metrics_v2_exp_histogram_points_1h_mv", MetricsV2ExpHistogramPoints1hCreateView)
 )
 
 // MaterializedViewData contains the template parameters for creating a

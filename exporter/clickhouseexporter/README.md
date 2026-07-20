@@ -341,9 +341,18 @@ time-series databases store data internally:
   `metrics_v2::rollups_enabled` flag): explicit-bounds histogram rollups. Scalar Count/Sum get
   the same First/Last/Sum treatment as the float tier; the per-bucket count arrays get
   First/Last (`argMin`/`argMax`) states for cumulative per-`le` chaining and a `sumForEach`
-  state for exact delta per-`le` window increases. Exponential histograms are NOT rolled up
-  (per-point Scale/Offset can vary, so element-wise bucket aggregation is unsafe without
-  downscale-merge logic); long-range exp-histogram queries use the raw table.
+  state for exact delta per-`le` window increases (safe element-wise: explicit bounds are
+  series identity, so buckets are positionally aligned by construction).
+- `otel_metrics_exp_histogram_points_5m` / `_1h` (+ `_mv` materialized views, same flag):
+  exponential histogram rollups. Exp-histogram buckets are not positionally aligned across
+  points (per-point Scale/Offset can vary), so `Scale` is part of the aggregation key —
+  states only ever merge within one scale, and a series that changes scale inside a bucket
+  yields one row per scale (the query layer downscale-merges them to the minimum scale) —
+  and bucket counts are stored as `Map(Int32, UInt64)` keyed by absolute bucket index
+  (`Offset + i`), summed with `sumMap` so per-point offset drift cannot corrupt the sums.
+  Delta temporality reads the additive Sum* columns; cumulative chains the First/Last
+  `argMin`/`argMax` tuple states (one consistent snapshot of
+  time/count/sum/zerocount/bucket maps per bucket edge).
 
 All attribute maps are written key-sorted, which improves Map column compression and makes the
 fingerprint stable. Timestamps use millisecond precision (`DateTime64(3)`). Point and exemplar
@@ -438,12 +447,13 @@ ClickHouse tables:
     objects derive their names from it)
   - `histogram_points_table_name` (default = `otel_metrics_histogram_points`; histogram rollup
     objects derive their names from it)
-  - `exp_histogram_points_table_name` (default = `otel_metrics_exp_histogram_points`)
+  - `exp_histogram_points_table_name` (default = `otel_metrics_exp_histogram_points`;
+    exp-histogram rollup objects derive their names from it)
   - `summary_points_table_name` (default = `otel_metrics_summary_points`)
   - `exemplars_table_name` (default = `otel_metrics_exemplars`)
   - `families_table_name` (default = `otel_metrics_families`)
   - `rollups_enabled` (default = `true`): create 5m/1h rollup tables and materialized views
-    (float points and explicit-bounds histogram points).
+    (float points, explicit-bounds histogram points, and exponential histogram points).
   - `series_cache_size` (default = `1048576`): max series tracked per day in the in-memory
     series dedup cache. Up to 8 recently-used day generations are kept (LRU by use, so mixed
     realtime + backfill timelines stay cached); worst-case memory is 8 × this × ~50 B

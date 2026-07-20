@@ -230,10 +230,9 @@ func (e *metricsV2Exporter) createSchema(ctx context.Context) error {
 
 	// Explicit-bounds histogram rollups: First/Last/Sum of the scalar columns
 	// plus per-bucket-array states (argMin/argMax for cumulative chaining,
-	// sumForEach for exact delta window increases). Exponential histograms are
-	// deliberately NOT rolled up: their per-point Scale/Offset can vary, so
-	// naive element-wise bucket aggregation is unsafe without downscale-merge
-	// logic — long-range exp-histogram queries stay on the raw tier.
+	// sumForEach for exact delta window increases). Bucket arrays are safe to
+	// aggregate element-wise because explicit bounds are series identity —
+	// every point of a series has positionally aligned buckets.
 	hist5m := v2.HistogramPointsTableName + "_5m"
 	hist1h := v2.HistogramPointsTableName + "_1h"
 	if err := execTable(sqltemplates.MetricsV2HistogramPoints5mCreateTableTmpl, hist5m, rollupTTL); err != nil {
@@ -246,6 +245,29 @@ func (e *metricsV2Exporter) createSchema(ctx context.Context) error {
 		return err
 	}
 	if err := execView(sqltemplates.MetricsV2HistogramPoints1hCreateViewTmpl, hist1h+"_mv", hist5m, hist1h); err != nil {
+		return err
+	}
+
+	// Exponential histogram rollups. Exp-histogram buckets are NOT
+	// positionally aligned across points (Scale and Offset may vary), so the
+	// tier differs from the explicit-bounds one in two ways: Scale is part of
+	// the aggregation key (states only merge within one scale — exact by
+	// construction; a mid-bucket scale change yields one row per scale, which
+	// the query layer downscale-merges), and bucket counts are stored as
+	// Map(absolute bucket index -> count) aggregated via sumMap, which is
+	// additive regardless of per-point offset drift.
+	expHist5m := v2.ExpHistogramPointsTableName + "_5m"
+	expHist1h := v2.ExpHistogramPointsTableName + "_1h"
+	if err := execTable(sqltemplates.MetricsV2ExpHistogramPoints5mCreateTableTmpl, expHist5m, rollupTTL); err != nil {
+		return err
+	}
+	if err := execView(sqltemplates.MetricsV2ExpHistogramPoints5mCreateViewTmpl, expHist5m+"_mv", v2.ExpHistogramPointsTableName, expHist5m); err != nil {
+		return err
+	}
+	if err := execTable(sqltemplates.MetricsV2ExpHistogramPoints1hCreateTableTmpl, expHist1h, rollupTTL); err != nil {
+		return err
+	}
+	if err := execView(sqltemplates.MetricsV2ExpHistogramPoints1hCreateViewTmpl, expHist1h+"_mv", expHist5m, expHist1h); err != nil {
 		return err
 	}
 

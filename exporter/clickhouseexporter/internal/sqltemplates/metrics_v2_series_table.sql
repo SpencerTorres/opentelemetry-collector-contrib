@@ -18,12 +18,18 @@ CREATE TABLE IF NOT EXISTS {{ident .Database}}.{{ident .TableName}} {{.ClusterSt
     `Quantiles` Array(Float64) COMMENT 'Summary quantile levels (summary series only); quantiles are part of the series identity' CODEC(ZSTD(1)),
     `FirstSeen` SimpleAggregateFunction(min, DateTime64(3)) COMMENT 'Earliest data point timestamp observed for this series on this day' CODEC(ZSTD(1)),
     `LastSeen` SimpleAggregateFunction(max, DateTime64(3)) COMMENT 'Latest data point timestamp observed when a series row was written' CODEC(ZSTD(1)),
+    `ResourceAttributeItems` Array(String) ALIAS arrayMap((arr) -> concat(arr.1, '=', arr.2), ResourceAttributes::Array(Tuple(String, String))),
+    `ScopeAttributeItems` Array(String) ALIAS arrayMap((arr) -> concat(arr.1, '=', arr.2), ScopeAttributes::Array(Tuple(String, String))),
+    `AttributeItems` Array(String) ALIAS arrayMap((arr) -> concat(arr.1, '=', arr.2), Attributes::Array(Tuple(String, String))),
     INDEX idx_res_attr_key mapKeys(ResourceAttributes) TYPE text(tokenizer = 'array'),
     INDEX idx_res_attr_value mapValues(ResourceAttributes) TYPE text(tokenizer = 'array'),
+    INDEX idx_res_attr_items ResourceAttributeItems TYPE text(tokenizer = 'array'),
     INDEX idx_scope_attr_key mapKeys(ScopeAttributes) TYPE text(tokenizer = 'array'),
     INDEX idx_scope_attr_value mapValues(ScopeAttributes) TYPE text(tokenizer = 'array'),
+    INDEX idx_scope_attr_items ScopeAttributeItems TYPE text(tokenizer = 'array'),
     INDEX idx_attr_key mapKeys(Attributes) TYPE text(tokenizer = 'array'),
-    INDEX idx_attr_value mapValues(Attributes) TYPE text(tokenizer = 'array')
+    INDEX idx_attr_value mapValues(Attributes) TYPE text(tokenizer = 'array'),
+    INDEX idx_attr_items AttributeItems TYPE text(tokenizer = 'array')
 ) ENGINE = AggregatingMergeTree
 PARTITION BY toYYYYMM(Date)
 ORDER BY (Date, MetricName, SeriesHash)

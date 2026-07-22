@@ -7,6 +7,7 @@ package clickhouseexporter
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -98,6 +99,53 @@ func verifyExporterMetricsV2(t *testing.T, exporter *metricsV2Exporter) {
 	require.Equal(t, uint64(pointsPerType), count("SELECT sum(PointCount) FROM "+table(v2.ExpHistogramPointsTableName+"_1h")))
 
 	verifyMetricsV2SeriesRow(t, exporter)
+	verifyMetricsV2AttributeItems(t, exporter)
+}
+
+// verifyMetricsV2AttributeItems checks the key=value full-text-search columns
+// on the series table: the ALIAS Items columns must agree with the equivalent
+// map predicates, and the text indexes over them must show up in the plan.
+func verifyMetricsV2AttributeItems(t *testing.T, exporter *metricsV2Exporter) {
+	v2 := &exporter.cfg.MetricsV2
+	seriesTable := fmt.Sprintf("otel_int_test.%q", v2.SeriesTableName)
+
+	queryStrings := func(query string) []string {
+		rows, err := exporter.db.Query(t.Context(), query)
+		require.NoError(t, err)
+		var values []string
+		for rows.Next() {
+			var v string
+			require.NoError(t, rows.Scan(&v))
+			values = append(values, v)
+		}
+		require.NoError(t, rows.Close())
+		return values
+	}
+
+	// The fixture's histogram, exponential histogram and summary series share
+	// the 'key'='value' data point attribute; has(AttributeItems, 'key=value')
+	// must return exactly those series.
+	require.Equal(t, []string{"exponential_histogram", "histogram", "summary"}, queryStrings(fmt.Sprintf(
+		"SELECT DISTINCT MetricType FROM %s WHERE has(AttributeItems, 'key=value') ORDER BY MetricType", seriesTable)))
+
+	// Each Items predicate must produce the same result set as the equivalent
+	// map-equality predicate.
+	requireSamePredicate := func(itemsPredicate, mapPredicate string) {
+		itemsHashes := queryStrings(fmt.Sprintf(
+			"SELECT DISTINCT toString(SeriesHash) FROM %s WHERE %s ORDER BY SeriesHash", seriesTable, itemsPredicate))
+		mapHashes := queryStrings(fmt.Sprintf(
+			"SELECT DISTINCT toString(SeriesHash) FROM %s WHERE %s ORDER BY SeriesHash", seriesTable, mapPredicate))
+		require.NotEmpty(t, itemsHashes)
+		require.Equal(t, mapHashes, itemsHashes)
+	}
+	requireSamePredicate("has(AttributeItems, 'key=value')", "Attributes['key'] = 'value'")
+	requireSamePredicate("has(ResourceAttributeItems, 'Resource Attributes 1=value1')", "ResourceAttributes['Resource Attributes 1'] = 'value1'")
+	requireSamePredicate("has(ScopeAttributeItems, 'Scope Attributes 1=value1')", "ScopeAttributes['Scope Attributes 1'] = 'value1'")
+
+	// The text index over AttributeItems must be applied to the has() filter.
+	plan := strings.Join(queryStrings(fmt.Sprintf(
+		"EXPLAIN indexes = 1 SELECT count() FROM %s WHERE has(AttributeItems, 'key=value')", seriesTable)), "\n")
+	require.Contains(t, plan, "idx_attr_items", "expected the text index in the query plan:\n%s", plan)
 }
 
 func verifyMetricsV2SeriesRow(t *testing.T, exporter *metricsV2Exporter) {

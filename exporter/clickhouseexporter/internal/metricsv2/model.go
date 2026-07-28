@@ -17,7 +17,7 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/column"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
-	"github.com/go-faster/city"
+	"github.com/cespare/xxhash/v2"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.uber.org/zap"
@@ -489,66 +489,215 @@ func (b *Batch) Insert(ctx context.Context, db driver.Conn, sqls InsertSQLs) err
 	return errs
 }
 
-// dedupToken builds a deterministic token for a batch of rows from boundary
-// values. Conversion is deterministic for a given OTLP payload, so a retried
-// push produces the identical token while distinct batches diverge in row
-// count, boundary series, timestamps, or boundary values.
-func dedupToken(parts ...uint64) string {
-	buf := make([]byte, 0, len(parts)*8)
-	for _, p := range parts {
-		buf = binary.LittleEndian.AppendUint64(buf, p)
+// Insert deduplication token, version 1.
+//
+// The token is "otelv2-" plus the 16-hex-digit 64-bit xxhash of EVERY row in
+// the table's insert block, in insertion order. ClickHouse deduplicates by
+// token alone (silently dropping a same-token block inside the dedup window),
+// so token equality must imply content equality: hashing only part of the
+// block would turn a token collision between two legitimately different
+// blocks into silent data loss. With full-content hashing, a dropped block
+// can only be a true duplicate (up to the 2^-64 xxhash collision rate).
+//
+// Determinism: xxhash64 is a seedless, spec-fixed function and every input is
+// canonical — conversion sorts attributes, strings and arrays are
+// length-prefixed, numbers are fixed-width little-endian, and no Go map is
+// iterated — so the same pdata content marshaled into the same insert block
+// yields the same token across process restarts and hosts. A retried request
+// that was rebatched upstream (different block composition) still gets a
+// different token and lands twice; that is only fixable once request
+// boundaries reach the exporter.
+//
+// The stream layout (one digest.Write per encoded row, preceded by a header
+// row of table tag + row count) must remain stable; treat any change as a new
+// token version.
+const (
+	tokenTableFloatPoints   = 0x01
+	tokenTableHistPoints    = 0x02
+	tokenTableExpHistPoints = 0x03
+	tokenTableSummaryPoints = 0x04
+	tokenTableExemplars     = 0x05
+)
+
+// tokenHasher streams row encodings into a 64-bit xxhash digest. Each row is
+// serialized into a small reusable buffer and fed to the digest with a single
+// Write, keeping token derivation allocation-free per row.
+type tokenHasher struct {
+	d   xxhash.Digest
+	row []byte
+}
+
+func newTokenHasher(table byte, rowCount int) *tokenHasher {
+	h := &tokenHasher{row: make([]byte, 0, 512)}
+	h.d.Reset()
+	h.writeByte(table)
+	h.writeU64(uint64(rowCount))
+	h.endRow()
+	return h
+}
+
+func (h *tokenHasher) writeByte(v byte) { h.row = append(h.row, v) }
+
+func (h *tokenHasher) writeU64(v uint64) {
+	h.row = binary.LittleEndian.AppendUint64(h.row, v)
+}
+
+func (h *tokenHasher) writeI64(v int64) { h.writeU64(uint64(v)) }
+
+func (h *tokenHasher) writeF64(v float64) { h.writeU64(math.Float64bits(v)) }
+
+func (h *tokenHasher) writeStr(s string) {
+	h.row = binary.AppendUvarint(h.row, uint64(len(s)))
+	h.row = append(h.row, s...)
+}
+
+func (h *tokenHasher) writeU64s(vs []uint64) {
+	h.row = binary.AppendUvarint(h.row, uint64(len(vs)))
+	for _, v := range vs {
+		h.writeU64(v)
 	}
-	return fmt.Sprintf("otelv2-%016x", city.CH64(buf))
+}
+
+func (h *tokenHasher) writeF64s(vs []float64) {
+	h.row = binary.AppendUvarint(h.row, uint64(len(vs)))
+	for _, v := range vs {
+		h.writeF64(v)
+	}
+}
+
+// writeAttrs encodes a key-sorted attribute map (as stored on the row) as a
+// count-prefixed list of key/value pairs. Iteration order is the map's own
+// deterministic (sorted) order; keys and values are always strings here.
+func (h *tokenHasher) writeAttrs(m column.IterableOrderedMap) {
+	n := uint64(0)
+	for it := m.Iterator(); it.Next(); {
+		n++
+	}
+	h.row = binary.AppendUvarint(h.row, n)
+	for it := m.Iterator(); it.Next(); {
+		k, _ := it.Key().(string)
+		v, _ := it.Value().(string)
+		h.writeStr(k)
+		h.writeStr(v)
+	}
+}
+
+// endRow feeds the accumulated row encoding to the digest and resets the
+// row buffer.
+func (h *tokenHasher) endRow() {
+	_, _ = h.d.Write(h.row) // xxhash.Digest.Write never fails
+	h.row = h.row[:0]
+}
+
+func (h *tokenHasher) token() string {
+	return fmt.Sprintf("otelv2-%016x", h.d.Sum64())
 }
 
 func (b *Batch) floatPointsToken() string {
 	if len(b.floatPoints) == 0 {
 		return ""
 	}
-	f, l := &b.floatPoints[0], &b.floatPoints[len(b.floatPoints)-1]
-	return dedupToken(uint64(len(b.floatPoints)),
-		f.hash, uint64(f.timestamp.UnixMilli()), math.Float64bits(f.value),
-		l.hash, uint64(l.timestamp.UnixMilli()), math.Float64bits(l.value))
+	h := newTokenHasher(tokenTableFloatPoints, len(b.floatPoints))
+	for i := range b.floatPoints {
+		p := &b.floatPoints[i]
+		h.writeStr(p.metricName)
+		h.writeU64(p.hash)
+		h.writeI64(p.startTime.UnixNano())
+		h.writeI64(p.timestamp.UnixNano())
+		h.writeF64(p.value)
+		h.writeByte(p.flags)
+		h.endRow()
+	}
+	return h.token()
 }
 
 func (b *Batch) histPointsToken() string {
 	if len(b.histPoints) == 0 {
 		return ""
 	}
-	f, l := &b.histPoints[0], &b.histPoints[len(b.histPoints)-1]
-	return dedupToken(uint64(len(b.histPoints)),
-		f.hash, uint64(f.timestamp.UnixMilli()), f.count,
-		l.hash, uint64(l.timestamp.UnixMilli()), l.count)
+	h := newTokenHasher(tokenTableHistPoints, len(b.histPoints))
+	for i := range b.histPoints {
+		p := &b.histPoints[i]
+		h.writeStr(p.metricName)
+		h.writeU64(p.hash)
+		h.writeI64(p.startTime.UnixNano())
+		h.writeI64(p.timestamp.UnixNano())
+		h.writeU64(p.count)
+		h.writeF64(p.sum)
+		h.writeF64(p.min)
+		h.writeF64(p.max)
+		h.writeU64s(p.bucketCounts)
+		h.writeByte(p.flags)
+		h.endRow()
+	}
+	return h.token()
 }
 
 func (b *Batch) expHistPointsToken() string {
 	if len(b.expHistPoints) == 0 {
 		return ""
 	}
-	f, l := &b.expHistPoints[0], &b.expHistPoints[len(b.expHistPoints)-1]
-	return dedupToken(uint64(len(b.expHistPoints)),
-		f.hash, uint64(f.timestamp.UnixMilli()), f.count,
-		l.hash, uint64(l.timestamp.UnixMilli()), l.count)
+	h := newTokenHasher(tokenTableExpHistPoints, len(b.expHistPoints))
+	for i := range b.expHistPoints {
+		p := &b.expHistPoints[i]
+		h.writeStr(p.metricName)
+		h.writeU64(p.hash)
+		h.writeI64(p.startTime.UnixNano())
+		h.writeI64(p.timestamp.UnixNano())
+		h.writeU64(p.count)
+		h.writeF64(p.sum)
+		h.writeF64(p.min)
+		h.writeF64(p.max)
+		h.writeByte(byte(p.scale))
+		h.writeU64(p.zeroCount)
+		h.writeF64(p.zeroThreshold)
+		h.writeI64(int64(p.positiveOffset))
+		h.writeU64s(p.positiveCounts)
+		h.writeI64(int64(p.negativeOffset))
+		h.writeU64s(p.negativeCounts)
+		h.writeByte(p.flags)
+		h.endRow()
+	}
+	return h.token()
 }
 
 func (b *Batch) summaryPointsToken() string {
 	if len(b.summaryPoints) == 0 {
 		return ""
 	}
-	f, l := &b.summaryPoints[0], &b.summaryPoints[len(b.summaryPoints)-1]
-	return dedupToken(uint64(len(b.summaryPoints)),
-		f.hash, uint64(f.timestamp.UnixMilli()), f.count,
-		l.hash, uint64(l.timestamp.UnixMilli()), l.count)
+	h := newTokenHasher(tokenTableSummaryPoints, len(b.summaryPoints))
+	for i := range b.summaryPoints {
+		p := &b.summaryPoints[i]
+		h.writeStr(p.metricName)
+		h.writeU64(p.hash)
+		h.writeI64(p.startTime.UnixNano())
+		h.writeI64(p.timestamp.UnixNano())
+		h.writeU64(p.count)
+		h.writeF64(p.sum)
+		h.writeF64s(p.quantileValues)
+		h.writeByte(p.flags)
+		h.endRow()
+	}
+	return h.token()
 }
 
 func (b *Batch) exemplarsToken() string {
 	if len(b.exemplars) == 0 {
 		return ""
 	}
-	f, l := &b.exemplars[0], &b.exemplars[len(b.exemplars)-1]
-	return dedupToken(uint64(len(b.exemplars)),
-		f.hash, uint64(f.timestamp.UnixMilli()), math.Float64bits(f.value),
-		l.hash, uint64(l.timestamp.UnixMilli()), math.Float64bits(l.value))
+	h := newTokenHasher(tokenTableExemplars, len(b.exemplars))
+	for i := range b.exemplars {
+		e := &b.exemplars[i]
+		h.writeStr(e.metricName)
+		h.writeU64(e.hash)
+		h.writeI64(e.timestamp.UnixNano())
+		h.writeF64(e.value)
+		h.writeStr(e.traceID)
+		h.writeStr(e.spanID)
+		h.writeAttrs(e.attrs)
+		h.endRow()
+	}
+	return h.token()
 }
 
 func (b *Batch) insertRows(ctx context.Context, db driver.Conn, name, sql, token string, appendFn func(driver.Batch) error) error {

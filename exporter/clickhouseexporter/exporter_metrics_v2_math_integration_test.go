@@ -108,6 +108,8 @@ func TestMetricsV2Math(t *testing.T) {
 	t.Run("AdvancedPromQL", func(t *testing.T) { mathTestAdvancedPromQL(t, exp1) })
 	t.Run("InsertScaleAndParts", func(t *testing.T) { mathTestInsertScaleAndParts(t, exp1) })
 	t.Run("StalenessMarkers", func(t *testing.T) { mathTestStalenessMarkers(t, exp1) })
+	// Inserts duplicate rows on purpose; must stay the last subtest.
+	t.Run("RetryDedup", func(t *testing.T) { mathTestRetryDedup(t, exp1) })
 }
 
 // mathTestPayload builds scrapes [from, to) for every series described above.
@@ -2362,4 +2364,92 @@ func mathTestExpHistogramRollups(t *testing.T, e *metricsV2Exporter) {
 		require.NoError(t, e.db.Exec(t.Context(), fmt.Sprintf("OPTIMIZE TABLE otel_int_test.%q FINAL", table)))
 	}
 	verify(t, true)
+}
+
+// mathTestRetryDedup pins the exact retry contract of the deterministic
+// insert_deduplication_token on a delta metric — the temporality where a
+// duplicate insert is summed into the rollup states permanently:
+//
+//   - a content-identical re-push (the exporterhelper retry shape) produces
+//     the same token, so ClickHouse drops the duplicate block from the raw
+//     table AND, via deduplicate_blocks_in_dependent_materialized_views, from
+//     every rollup tier;
+//   - the same rows re-sent inside a differently-composed block (upstream
+//     rebatching merged in an unrelated metric) produce a different token and
+//     are counted twice. This documents the honest limitation: without
+//     request identity reaching the exporter, only byte/content-identical
+//     re-sends are deduplicable.
+//
+// Inserts duplicate rows on purpose, so it must remain the last subtest.
+func mathTestRetryDedup(t *testing.T, e *metricsV2Exporter) {
+	v2 := &e.cfg.MetricsV2
+	table5m := v2.PointsTableName + "_5m"
+	table1h := v2.PointsTableName + "_1h"
+	retryT0 := mathT0.Add(6 * time.Hour) // clear of every other scenario's buckets
+
+	// Four delta increments of 2, one 5m bucket: totals are trivially 8 once,
+	// 16 when double-counted.
+	payload := func(rebatched bool) pmetric.Metrics {
+		md := pmetric.NewMetrics()
+		rm := md.ResourceMetrics().AppendEmpty()
+		rm.Resource().Attributes().PutStr("service.name", "svc-retry")
+		sm := rm.ScopeMetrics().AppendEmpty()
+		sm.Scope().SetName("mathtest")
+		sm.Scope().SetVersion("1.0")
+		m := sm.Metrics().AppendEmpty()
+		m.SetName("test.retry.jobs")
+		m.SetUnit("{jobs}")
+		s := m.SetEmptySum()
+		s.SetAggregationTemporality(pmetric.AggregationTemporalityDelta)
+		s.SetIsMonotonic(true)
+		for i := 0; i < 4; i++ {
+			dp := s.DataPoints().AppendEmpty()
+			dp.SetTimestamp(pcommon.NewTimestampFromTime(retryT0.Add(time.Duration(i) * mathScrapeInterval)))
+			dp.SetStartTimestamp(pcommon.NewTimestampFromTime(retryT0.Add(time.Duration(i-1) * mathScrapeInterval)))
+			dp.SetDoubleValue(2)
+			dp.Attributes().PutStr("queue", "retry")
+		}
+		if rebatched {
+			// Upstream rebatching: the retried data arrives merged with an
+			// unrelated metric, changing the float-points block composition
+			// (5 rows instead of 4) and therefore the token.
+			g := sm.Metrics().AppendEmpty()
+			g.SetName("test.retry.noise")
+			dp := g.SetEmptyGauge().DataPoints().AppendEmpty()
+			dp.SetTimestamp(pcommon.NewTimestampFromTime(retryT0))
+			dp.SetDoubleValue(1)
+		}
+		return md
+	}
+
+	rawCount := func() uint64 {
+		return scanUInt(t, e, fmt.Sprintf(
+			`SELECT count() FROM otel_int_test.%q WHERE MetricName = 'test.retry.jobs'`, v2.PointsTableName))
+	}
+	rollupCount := func(table string) uint64 {
+		return scanUInt(t, e, fmt.Sprintf(
+			`SELECT sum(Count) FROM otel_int_test.%q WHERE MetricName = 'test.retry.jobs'`, table))
+	}
+	rollupSum := func(table string) float64 {
+		return scanFloat(t, e, fmt.Sprintf(
+			`SELECT sum(Sum) FROM otel_int_test.%q WHERE MetricName = 'test.retry.jobs'`, table))
+	}
+
+	// Same batch pushed twice = same token: the raw table and both rollup
+	// tiers must count it exactly once.
+	md := payload(false)
+	require.NoError(t, e.pushMetricsData(t.Context(), md))
+	require.NoError(t, e.pushMetricsData(t.Context(), md))
+	require.Equal(t, uint64(4), rawCount(), "content-identical retry must dedup in the raw table")
+	require.Equal(t, uint64(4), rollupCount(table5m), "content-identical retry must dedup through the 5m MV")
+	require.Equal(t, uint64(4), rollupCount(table1h), "content-identical retry must dedup through the 1h cascade")
+	require.InDelta(t, 8.0, rollupSum(table5m), 1e-9)
+
+	// The identical delta rows re-sent in a rebatched block get a different
+	// token and land AGAIN — permanently doubled in the delta rollup sums.
+	require.NoError(t, e.pushMetricsData(t.Context(), payload(true)))
+	require.Equal(t, uint64(8), rawCount(), "a rebatched retry is not deduplicable without request identity")
+	require.Equal(t, uint64(8), rollupCount(table5m), "the rebatched duplicate is summed into the 5m states")
+	require.Equal(t, uint64(8), rollupCount(table1h))
+	require.InDelta(t, 16.0, rollupSum(table5m), 1e-9)
 }

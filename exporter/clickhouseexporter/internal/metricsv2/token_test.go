@@ -81,11 +81,11 @@ func TestDedupTokenGolden(t *testing.T) {
 	addAllTypes(t, b, []string{"label_a", "label_b"})
 
 	assert.Equal(t, map[string]string{
-		"points":         "otelv2-781eebe6464f7c5b",
-		"histogram":      "otelv2-c46e6f19aec713bd",
-		"exp histogram":  "otelv2-c5dd47c05615f0fc",
-		"summary points": "otelv2-56c224dcab6762c0",
-		"exemplars":      "otelv2-c34ba6388d39ea1f",
+		"points":         "otelv2-8065309353ecc4a2",
+		"histogram":      "otelv2-ba28c524d31d8c0a",
+		"exp histogram":  "otelv2-7ba8b93c3c8c30d6",
+		"summary points": "otelv2-4ee245fac823bf38",
+		"exemplars":      "otelv2-634d733737e6d5e1",
 	}, allTokens(b))
 }
 

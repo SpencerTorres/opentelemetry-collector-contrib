@@ -32,10 +32,16 @@ import (
 //	0x03 <data point attributes>
 //	0x04 uvarint(count) <explicit bounds>    (histogram series only)
 //	0x05 uvarint(count) <quantile levels>    (summary series only)
+//	0x06 <temporality byte> <isMonotonic byte>    (every metric type, always last)
 //
 // Note the 0x02 section byte appears twice in the scope section: once before
 // the name/version strings and once as the attribute-map prefix (writeAttrs
 // always emits its section byte). The golden test pins this exact layout.
+//
+// The 0x06 section encodes the data point's aggregation temporality as a
+// single byte (0 = unspecified, 1 = delta, 2 = cumulative; gauges and
+// summaries are always 0) followed by an isMonotonic byte (1 iff the metric
+// is a Sum with IsMonotonic=true at that point, else 0).
 //
 // Design notes:
 //   - Attribute keys are namespaced by section, so a resource attribute and a
@@ -45,8 +51,11 @@ import (
 //     `le`-labeled series: changing the bucket layout produces a new series.
 //   - Attribute values are hashed exactly as stored (pcommon.Value.AsString),
 //     so the hash of a stored row can be reproduced from the row itself.
-//   - Metric type, unit, and temporality are metadata, not identity, and are
-//     deliberately excluded.
+//   - Temporality and monotonicity are part of the series identity: a
+//     mid-stream temporality flip produces a new series rather than mixing
+//     delta and cumulative points under one fingerprint.
+//   - Metric type and unit are metadata, not identity, and are deliberately
+//     excluded.
 //
 // This serialization must remain stable; treat any change as a new hash
 // version requiring a new schema revision.
@@ -57,7 +66,28 @@ const (
 	sectionDataPointAttrs = 0x03
 	sectionBounds         = 0x04
 	sectionQuantiles      = 0x05
+	sectionTemporality    = 0x06
 )
+
+// Temporality byte values in the 0x06 section.
+const (
+	temporalityByteUnspecified byte = 0
+	temporalityByteDelta       byte = 1
+	temporalityByteCumulative  byte = 2
+)
+
+// temporalityByte maps the stored Temporality column value (the same string
+// finishPoint writes into the series row) to its hash byte.
+func temporalityByte(temporality string) byte {
+	switch temporality {
+	case temporalityDelta:
+		return temporalityByteDelta
+	case temporalityCumulative:
+		return temporalityByteCumulative
+	default:
+		return temporalityByteUnspecified
+	}
+}
 
 // attrPair is a single key/value attribute with the value already rendered
 // the same way it is stored in ClickHouse Map columns.
@@ -134,6 +164,18 @@ func (h *hasher) writeFloats(section byte, vals []float64) {
 	h.buf = binary.AppendUvarint(h.buf, uint64(len(vals)))
 	for _, v := range vals {
 		h.buf = binary.LittleEndian.AppendUint64(h.buf, math.Float64bits(v))
+	}
+}
+
+// writeTemporality appends the 0x06 temporality/monotonicity section. It is
+// written for every metric type and must always be the final section.
+func (h *hasher) writeTemporality(temporality byte, isMonotonic bool) {
+	h.writeByte(sectionTemporality)
+	h.writeByte(temporality)
+	if isMonotonic {
+		h.writeByte(1)
+	} else {
+		h.writeByte(0)
 	}
 }
 

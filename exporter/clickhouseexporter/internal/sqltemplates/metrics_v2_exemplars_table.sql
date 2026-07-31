@@ -11,4 +11,4 @@ CREATE TABLE IF NOT EXISTS {{ident .Database}}.{{ident .TableName}} {{.ClusterSt
 PARTITION BY toDate(TimeUnix)
 ORDER BY (MetricName, SeriesHash, TimeUnix)
 {{.TTL}}
-SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = 512
+SETTINGS index_granularity = 8192, ttl_only_drop_parts = 1, non_replicated_deduplication_window = 8192, replicated_deduplication_window = 8192

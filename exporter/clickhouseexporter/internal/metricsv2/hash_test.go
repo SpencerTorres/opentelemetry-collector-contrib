@@ -76,6 +76,32 @@ func TestHasherBoundsChangeIdentity(t *testing.T) {
 		"histogram bucket bounds are part of the series identity")
 }
 
+func TestHasherTemporalityChangesIdentity(t *testing.T) {
+	build := func(temporality byte, isMonotonic bool) uint64 {
+		var h hasher
+		h.writeByte(sectionMetricName)
+		h.writeString("metric")
+		h.writeTemporality(temporality, isMonotonic)
+		return h.sum()
+	}
+
+	deltaSum := build(temporalityByteDelta, true)
+	cumulativeSum := build(temporalityByteCumulative, true)
+	nonMonotonic := build(temporalityByteCumulative, false)
+
+	assert.NotEqual(t, deltaSum, cumulativeSum,
+		"a temporality flip must produce a new series identity")
+	assert.NotEqual(t, cumulativeSum, nonMonotonic,
+		"monotonicity is part of the series identity")
+}
+
+func TestTemporalityByteMapping(t *testing.T) {
+	assert.Equal(t, temporalityByteUnspecified, temporalityByte(temporalityUnspecified))
+	assert.Equal(t, temporalityByteDelta, temporalityByte(temporalityDelta))
+	assert.Equal(t, temporalityByteCumulative, temporalityByte(temporalityCumulative))
+	assert.Equal(t, temporalityByteUnspecified, temporalityByte(""), "unknown values map to unspecified")
+}
+
 func TestHasherTruncateReuse(t *testing.T) {
 	var h hasher
 	h.writeAttrs(sectionResourceAttrs, []attrPair{{"res", "1"}})
@@ -119,8 +145,9 @@ func TestSeriesHashGolden(t *testing.T) {
 	h.writeString("http.server.request.duration")
 	h.writeAttrs(sectionDataPointAttrs, sortedPairs(dp, nil))
 	h.writeFloats(sectionBounds, []float64{0.005, 0.01, 0.025})
+	h.writeTemporality(temporalityByteCumulative, false)
 
-	assert.Equal(t, uint64(0x5e339cb4a7a309a9), h.sum())
+	assert.Equal(t, uint64(0xecbc555bddc8ab09), h.sum())
 }
 
 func TestOrderedMapFromPairsIteratesSorted(t *testing.T) {

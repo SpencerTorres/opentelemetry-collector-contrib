@@ -247,7 +247,11 @@ func (b *Batch) AddMetric(metric pmetric.Metric) error {
 
 // finishPoint finalizes the hash for a data point whose sections (including
 // any extras) have been written, then registers the series row if it is new.
+// The trailing 0x06 temporality/monotonicity section is appended here, from
+// the same values stored on the series row, so it is always the last section
+// for every metric type.
 func (b *Batch) finishPoint(metric pmetric.Metric, metricType, temporality string, isMonotonic bool, ts time.Time, bounds, quantiles []float64) uint64 {
+	b.h.writeTemporality(temporalityByte(temporality), isMonotonic)
 	hash := b.h.sum()
 
 	day := int32(ts.Unix() / secondsPerDay)

@@ -18,4 +18,4 @@ CREATE TABLE IF NOT EXISTS {{ident .Database}}.{{ident .TableName}} {{.ClusterSt
 PARTITION BY toYYYYMM(TimeBucket)
 ORDER BY (MetricName, SeriesHash, TimeBucket, Scale)
 {{.TTL}}
-SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 512
+SETTINGS index_granularity = 8192, non_replicated_deduplication_window = 8192, replicated_deduplication_window = 8192
